@@ -1,6 +1,3 @@
-# =====================================================
-# GEVENT YAMASI (MUTLAKA EN ÜSTTE)
-# =====================================================
 from gevent import monkey
 monkey.patch_all()
 
@@ -10,91 +7,91 @@ import sys
 import time
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import urljoin, quote, unquote
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from functools import lru_cache
 
 app = Flask(__name__)
 
 # =====================================================
 # AYARLAR
 # =====================================================
-UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-
 HEADERS = {
-    "User-Agent": UA,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Referer": "https://vavoo.to/",
     "Origin": "https://vavoo.to",
-    "Accept": "*/*",
     "Connection": "keep-alive"
 }
 
 requests.packages.urllib3.disable_warnings()
 
-# =====================================================
-# GELİŞMİŞ BAĞLANTI HAVUZU
-# =====================================================
-def get_session():
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        read=3,
-        connect=3,
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
-
-# Global session yerine, her rota kendi taze session'ını kullanacak 
-# ama adapter ayarları optimize edildi.
+# Bağlantı Havuzu
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500, max_retries=3)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
 
 # =====================================================
-# ROTA 1: KANAL LİSTESİ
+# ÖNBELLEK MEKANİZMASI (TiviMate Spam Engelleyici)
 # =====================================================
+# Playlist'i 5 saniye boyunca hafızada tutar. 
+# TiviMate 100 kere de istese Vavoo'ya gitmez, buradan verir.
+class TTL_Cache:
+    def __init__(self, ttl=5):
+        self.cache = {}
+        self.ttl = ttl
+
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+        return None
+
+    def set(self, key, value):
+        self.cache[key] = (value, time.time())
+
+playlist_cache = TTL_Cache(ttl=6) # 6 Saniye cache
+
+# =====================================================
+# ROTALAR
+# =====================================================
+
 @app.route('/')
 def root():
-    session = get_session()
     try:
-        r = session.get("https://vavoo.to/live2/index", headers=HEADERS, verify=False, timeout=15)
-        r.raise_for_status()
+        r = session.get("https://vavoo.to/live2/index", headers=HEADERS, verify=False, timeout=10)
         data = r.text
     except Exception as e:
-        return f"Liste Hatasi: {str(e)}", 500
+        return f"Hata: {e}", 502
 
     base_url = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
     
-    # Hızlı Regex
+    # Kanal listesi
     pattern = re.compile(r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"', re.DOTALL)
-    
     for m in pattern.finditer(data):
         name = m.group(1).encode().decode('unicode_escape').replace(',', '')
         id_match = re.search(r'/play/(\d+)', m.group(2))
         if id_match:
-            cid = id_match.group(1)
-            # TiviMate için .m3u8 uzantısı önemlidir
-            out.append(f'#EXTINF:-1 group-title="Turkey",{name}\n{base_url}/playlist/{cid}.m3u8')
+            out.append(f'#EXTINF:-1 group-title="Turkey",{name}\n{base_url}/playlist/{id_match.group(1)}.m3u8')
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
-# =====================================================
-# ROTA 2: M3U8 PROXY
-# =====================================================
 @app.route('/playlist/<cid>.m3u8')
 def playlist_proxy(cid):
-    vavoo_url = f"https://vavoo.to/play/{cid}/index.m3u8"
-    session = get_session()
+    # 1. Önce Cache'e bak (TiviMate saldırısını engelle)
+    cached_data = playlist_cache.get(cid)
+    if cached_data:
+        return Response(cached_data, content_type="application/vnd.apple.mpegurl")
 
+    vavoo_url = f"https://vavoo.to/play/{cid}/index.m3u8"
+    
     try:
-        # Vavoo'ya git
-        r = session.get(vavoo_url, headers=HEADERS, verify=False, timeout=10, allow_redirects=True)
-        if r.status_code != 200:
-            return Response("Yayin Yok", status=404)
+        # 2. Vavoo'dan taze veri çek
+        r = session.get(vavoo_url, headers=HEADERS, verify=False, timeout=8, allow_redirects=True)
+        if r.status_code != 200: return Response("Yayin Yok", status=404)
         
+        final_url = r.url
         content = r.text
-        final_url = r.url # Yönlendirme olduysa son adresi al
 
         # Master Playlist Kontrolü
         if "#EXT-X-STREAM-INF" in content:
@@ -102,10 +99,11 @@ def playlist_proxy(cid):
             for line in reversed(lines):
                 if line and not line.startswith("#"):
                     final_url = urljoin(final_url, line)
-                    r = session.get(final_url, headers=HEADERS, verify=False, timeout=10)
+                    r = session.get(final_url, headers=HEADERS, verify=False, timeout=8)
                     content = r.text
                     break
         
+        # Linkleri Dönüştür
         base_ts = final_url.rsplit('/', 1)[0] + '/'
         new_lines = []
         
@@ -116,71 +114,41 @@ def playlist_proxy(cid):
             if line.startswith("#"):
                 new_lines.append(line)
             else:
-                # TS linkini oluştur
-                full_ts_url = urljoin(base_ts, line)
-                # Linki şifrele (Encode)
-                encoded_url = quote(full_ts_url)
-                # Proxy linkini yaz
-                new_lines.append(f"{request.host_url.rstrip('/')}/seg?url={encoded_url}")
+                full_ts = urljoin(base_ts, line)
+                enc_url = quote(full_ts)
+                new_lines.append(f"{request.host_url.rstrip('/')}/seg?url={enc_url}")
 
-        return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
+        result = "\n".join(new_lines)
+        
+        # 3. Sonucu Cache'e kaydet
+        playlist_cache.set(cid, result)
+        
+        return Response(result, content_type="application/vnd.apple.mpegurl")
 
-    except Exception as e:
-        print(f"Playlist Error: {e}", file=sys.stderr)
+    except Exception:
         return Response("Server Error", status=500)
 
-# =====================================================
-# ROTA 3: SEGMENT PROXY (0 BYTE FIX)
-# =====================================================
 @app.route('/seg')
 def segment_proxy():
     target_url = unquote(request.args.get('url'))
     if not target_url: return "No URL", 400
 
-    # 1. Önce Bağlantıyı Kur (Veri akışı başlamadan yanıt dönme!)
-    session = get_session()
-    try:
-        # stream=True ile isteği başlatıyoruz ama içeriği henüz okumuyoruz
-        upstream_req = session.get(
-            target_url, 
-            headers=HEADERS, 
-            verify=False, 
-            stream=True, 
-            timeout=(5, 30), # (Connect, Read)
-            allow_redirects=True
-        )
-        
-        # 2. Vavoo hata verdiyse BİZ DE HATA VERELİM (200 OK Dönme!)
-        if upstream_req.status_code != 200:
-            upstream_req.close()
-            return Response(f"Upstream Error {upstream_req.status_code}", status=upstream_req.status_code)
-        
-        # 3. İçerik uzunluğu 0 ise veya boşsa hata ver
-        # (Content-Length her zaman gelmeyebilir ama kontrol etmek iyidir)
-        if upstream_req.headers.get('Content-Length') == '0':
-             upstream_req.close()
-             return Response("Empty Stream", status=502)
+    def generate():
+        try:
+            # TiviMate için uzun timeout ve stream
+            with session.get(target_url, headers=HEADERS, verify=False, stream=True, timeout=(5, 45)) as r:
+                
+                if r.status_code != 200:
+                    return # Hata dön, TiviMate tekrar dener
 
-        # 4. Her şey yolundaysa Jeneratörü Başlat
-        def generate():
-            try:
-                for chunk in upstream_req.iter_content(chunk_size=65536):
+                # 64KB ideal boyuttur
+                for chunk in r.iter_content(chunk_size=65536):
                     if chunk: yield chunk
-            except Exception as e:
-                print(f"Stream Cut: {e}", file=sys.stderr)
-            finally:
-                upstream_req.close()
+                    
+        except Exception:
+            pass
 
-        # Flask'a yanıtı şimdi gönderiyoruz
-        return Response(
-            stream_with_context(generate()), 
-            content_type="video/mp2t",
-            status=200
-        )
-
-    except Exception as e:
-        print(f"Proxy Connection Error: {e}", file=sys.stderr)
-        return Response("Connection Failed", status=502)
+    return Response(stream_with_context(generate()), content_type="video/mp2t")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, threaded=True)
