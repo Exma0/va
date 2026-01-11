@@ -1,13 +1,16 @@
 from gevent import monkey
 monkey.patch_all()
 
+import json
 import re
 import requests
 import time
 import sys
+import urllib3
 from flask import Flask, Response, request, stream_with_context
-from urllib.parse import urljoin, quote, unquote
+from urllib.parse import urljoin, quote, unquote, urlparse
 from threading import Lock, RLock
+from gevent.pywsgi import WSGIServer
 
 app = Flask(__name__)
 
@@ -20,16 +23,18 @@ HEADERS = {
     "Origin": "https://vavoo.to",
     "Connection": "keep-alive"
 }
-requests.packages.urllib3.disable_warnings()
 
-# Bağlantı Havuzu
+# SSL Uyarılarını Kapat
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Bağlantı Havuzu (Performans için optimize edildi)
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500, max_retries=2)
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=2)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
 # =====================================================
-# THE BRAIN (Mantık Hatası Giderilmiş Versiyon)
+# THE BRAIN (Yayın Çözümleme Merkezi)
 # =====================================================
 class StreamBrain:
     def __init__(self):
@@ -47,24 +52,21 @@ class StreamBrain:
     def resolve_stream_url(self, cid, force_refresh=False):
         """
         Kanalın en son çalışan 'index.m3u8' adresini (Redirectler çözülmüş halde) bulur.
-        Base URL değil, Full URL döner.
         """
-        # Cache Kontrolü
+        # Cache Kontrolü (5 Dakika)
         if not force_refresh and cid in self.channels:
-            # 5 Dakika (300sn) cache süresi
             if time.time() - self.channels[cid]['updated_at'] < 300:
                 return self.channels[cid]['final_url']
 
         lock = self.get_lock(cid)
         with lock:
-            # Double Check (Kilit açılınca tekrar bak)
+            # Double Check
             if not force_refresh and cid in self.channels:
                 if time.time() - self.channels[cid]['updated_at'] < 300:
                     return self.channels[cid]['final_url']
             
-            # --- VAVOO SORGUSU ---
             try:
-                # 1. İlk İstek
+                # 1. Vavoo API İsteği
                 initial_url = f"https://vavoo.to/play/{cid}/index.m3u8"
                 r = session.get(initial_url, headers=HEADERS, verify=False, timeout=8, allow_redirects=True)
                 if r.status_code != 200: return None
@@ -76,14 +78,12 @@ class StreamBrain:
                 # Eğer Master Playlist ise (Kalite seçenekleri varsa)
                 if "#EXT-X-STREAM-INF" in content:
                     lines = content.splitlines()
-                    # En son satırdaki linki al (Genelde en yüksek kalite)
+                    # Genelde en yüksek kalite en sondadır
                     for line in reversed(lines):
                         if line and not line.startswith("#"):
-                            # urljoin kullanımı: Mantık hatasını çözer
-                            # Göreli linki tam linke çevirir
                             current_url = urljoin(current_url, line)
                             
-                            # O linkin içindeki gerçek medya playlist'i doğrula
+                            # O linkin çalıştığını doğrula
                             try:
                                 r2 = session.get(current_url, headers=HEADERS, timeout=5)
                                 if r2.status_code == 200:
@@ -92,7 +92,6 @@ class StreamBrain:
                             break
                 
                 # 3. Sonuçları Kaydet
-                # Base URL değil, direkt çalışan son m3u8 linkini saklıyoruz.
                 self.channels[cid] = {
                     'final_url': current_url,
                     'updated_at': time.time()
@@ -111,36 +110,41 @@ brain = StreamBrain()
 
 @app.route('/')
 def root():
+    # Regex yerine JSON parse kullanıyoruz (Daha güvenli)
     try:
         r = session.get("https://vavoo.to/live2/index", headers=HEADERS, verify=False, timeout=10)
-        data = r.text
+        data = r.json()
     except:
-        return "Liste Hatasi", 502
+        return "Liste Çekilemedi", 502
 
     base_app_url = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
-    pattern = re.compile(r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"', re.DOTALL)
     
-    for m in pattern.finditer(data):
-        name = m.group(1).encode().decode('unicode_escape').replace(',', '')
-        id_match = re.search(r'/play/(\d+)', m.group(2))
-        if id_match:
-            cid = id_match.group(1)
-            out.append(f'#EXTINF:-1 group-title="Turkey",{name}\n{base_app_url}/live/{cid}.m3u8')
+    # JSON verisini işle
+    for item in data:
+        # Sadece Türkiye grubu (İsteğe bağlı değiştirilebilir)
+        if item.get("group") == "Turkey":
+            name = item.get("name", "Unknown").replace(',', '')
+            url = item.get("url", "")
+            
+            # URL içinden ID'yi al
+            match = re.search(r'/play/(\d+)', url)
+            if match:
+                cid = match.group(1)
+                logo = item.get("logo", "")
+                out.append(f'#EXTINF:-1 group-title="Turkey" tvg-logo="{logo}",{name}\n{base_app_url}/live/{cid}.m3u8')
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    # 1. Beyinden çalışan URL'yi al
     final_url = brain.resolve_stream_url(cid)
     if not final_url: return Response("Yayin Yok", status=404)
 
     try:
-        # 2. İçeriği çek
         r = session.get(final_url, headers=HEADERS, verify=False, timeout=6)
         
-        # Hata varsa (Token süresi dolmuş olabilir), yenile ve tekrar dene
+        # Token süresi dolmuşsa yenile
         if r.status_code != 200:
             final_url = brain.resolve_stream_url(cid, force_refresh=True)
             if not final_url: return Response("Yayin Kirik", status=503)
@@ -149,7 +153,6 @@ def playlist_handler(cid):
         content = r.text
         new_lines = []
         
-        # 3. Satırları işle
         for line in content.splitlines():
             line = line.strip()
             if not line: continue
@@ -157,17 +160,15 @@ def playlist_handler(cid):
             if line.startswith("#"):
                 new_lines.append(line)
             else:
-                # MANTIK DÜZELTMESİ:
-                # segment linkini oluştururken r.url (istek yapılan son adres) kullanıyoruz.
-                # Böylece göreli yollar (../../segment.ts) doğru hesaplanır.
-                # Şifrelemeyi kaldırıp parametreye gömüyoruz.
+                # TS dosyası linkini tam URL'ye çevir
+                # r.url kullanıyoruz ki redirect sonrası doğru path bulunsun
+                ts_full_url = urljoin(r.url, line)
                 
-                # Dosya adını quote ile güvenli hale getiriyoruz çünkü içinde ?token= olabilir
-                original_segment_url = urljoin(r.url, line)
-                safe_segment_url = quote(original_segment_url)
+                # URL'yi güvenli hale getir (quote)
+                safe_target = quote(ts_full_url)
                 
-                # Parametre olarak CID'yi de ekliyoruz ki segment hata verirse onarabilelim
-                new_lines.append(f"{request.host_url.rstrip('/')}/seg?cid={cid}&target={safe_segment_url}")
+                # Proxy linkini oluştur
+                new_lines.append(f"{request.host_url.rstrip('/')}/seg?cid={cid}&target={safe_target}")
 
         return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
 
@@ -176,62 +177,53 @@ def playlist_handler(cid):
 
 @app.route('/seg')
 def segment_handler():
-    # Parametreleri al: Hem hedef URL'yi hem de Kanal ID'yi biliyoruz
     cid = request.args.get('cid')
     target_url_encoded = request.args.get('target')
     
     if not cid or not target_url_encoded: return "Bad Request", 400
     
-    # İlk hedef URL (Playlistten gelen)
     current_target_url = unquote(target_url_encoded)
-
-    # =================================================================
-    # MANTIK HATASI GİDERİLMİŞ AKIŞ MİMARİSİ
-    # =================================================================
-    # Önce bağlantıyı kurmaya çalışıyoruz. Eğer bağlantı kurulamazsa
-    # Flask'a Response nesnesi döndürmüyoruz. Hata kodunu döndürüyoruz.
-    # Böylece TiviMate "200 OK" alıp boş dosya ile karşılaşmıyor.
-    
     final_response = None
     
-    # 3 Deneme Hakkı
+    # 3 Deneme Hakkı (Retry Logic)
     for attempt in range(3):
         try:
-            # Eğer önceki deneme başarısız olduysa ve URL yenilendiyse:
+            # İlk deneme başarısızsa ve URL yenileme gerekiyorsa:
             if attempt > 0:
-                # Yeni base URL'yi bul
                 new_base_m3u8 = brain.resolve_stream_url(cid, force_refresh=True)
                 if new_base_m3u8:
-                    # Eski segment ismini (filename) URL'den ayıkla
-                    # Bu kısım risklidir ama Vavoo yapısında genelde dosya isimleri korunur
-                    file_name = current_target_url.split('/')[-1]
-                    # Yeni URL oluştur
+                    # ESKİ KOD HATASI DÜZELTİLDİ:
+                    # Eski URL'deki token karmaşasını atıp sadece dosya ismini alıyoruz.
+                    parsed_old_url = urlparse(current_target_url)
+                    file_name = parsed_old_url.path.split('/')[-1]
+                    
+                    # Yeni temiz URL oluştur
                     current_target_url = urljoin(new_base_m3u8, file_name)
 
-            # İsteği başlat (stream=True henüz veri indirmez, sadece başlıkları alır)
             upstream = session.get(current_target_url, headers=HEADERS, verify=False, stream=True, timeout=10)
             
             if upstream.status_code == 200:
                 final_response = upstream
-                break # Başarılı! Döngüden çık.
+                break
+            elif upstream.status_code in [403, 410, 404]:
+                # Token hatası veya bulunamadı -> Döngü başa döner, URL yenilenir
+                upstream.close()
+                continue
             else:
                 upstream.close()
-                # Başarısız. 403 veya 404.
-                # Loop devam edecek -> attempt artacak -> URL yenilenecek.
                 continue
 
         except Exception:
             time.sleep(0.5)
             continue
 
-    # 3 deneme sonunda hala başarılı bir bağlantı yoksa HATA DÖN
     if not final_response:
         return Response("Segment Unavailable", status=503)
 
-    # Başarılı bağlantıyı kullanıcıya akıt
     def generate(upstream_resp):
         try:
-            for chunk in upstream_resp.iter_content(chunk_size=65536):
+            # Chunk boyutu video için ideal seviyeye çekildi (128KB)
+            for chunk in upstream_resp.iter_content(chunk_size=131072):
                 if chunk: yield chunk
         except:
             pass
@@ -240,5 +232,16 @@ def segment_handler():
 
     return Response(stream_with_context(generate(final_response)), content_type="video/mp2t")
 
+# =====================================================
+# MAIN (Gevent WSGI Server)
+# =====================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    # Flask'ın kendi run() metodu yerine Gevent WSGIServer kullanıyoruz.
+    # Bu, monkey.patch_all() ile tam uyumlu çalışmasını sağlar.
+    port = 8080
+    print(f"Sunucu baslatiliyor: http://0.0.0.0:{port}")
+    try:
+        http_server = WSGIServer(('0.0.0.0', port), app)
+        http_server.serve_forever()
+    except KeyboardInterrupt:
+        print("Kapatiliyor...")
