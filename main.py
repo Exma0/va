@@ -3,121 +3,164 @@ import re
 import time
 import threading
 import queue
+from collections import deque
 from urllib.parse import urljoin, urlparse
 from flask import Flask, Response, request, stream_with_context
 
+# ======================================================
+# APP
+# ======================================================
 app = Flask(__name__)
 requests.packages.urllib3.disable_warnings()
 
-# Global ayarlar
+# ======================================================
+# GLOBAL HEADERS
+# ======================================================
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-HEADERS = {"User-Agent": UA, "Referer": "https://vavoo.to/", "Connection": "keep-alive"}
+HEADERS = {
+    "User-Agent": UA,
+    "Referer": "https://vavoo.to/",
+    "Origin": "https://vavoo.to",
+    "Connection": "keep-alive"
+}
 
+# ======================================================
+# URL RESOLVER
+# ======================================================
 def resolve_url(base, rel):
     return urljoin(base, rel)
 
+# ======================================================
+# MAIN CONTROLLER
+# ======================================================
 @app.route('/')
-def main_controller():
+def controller():
     channel_id = request.args.get('id')
-    
-    if channel_id:
-        # Buffer Boyutu: 512MB RAM'in yaklaşık 100-150MB'ını sadece videoya ayırıyoruz (Yaklaşık 10-15 segment)
-        # 0.1 CPU olduğu için thread sayısını dengeli tutuyoruz
-        buffer_queue = queue.Queue(maxsize=15) 
-        played_segments = set()
 
-        def generate():
+    # ==================================================
+    # PLAY MODE
+    # ==================================================
+    if channel_id:
+
+        buffer_queue = queue.Queue(maxsize=12)   # ~10–15 sn RAM buffer
+        played_segments = deque(maxlen=100)      # FIFO segment takibi
+
+        def stream_generator():
+            # ------------------------------
+            # MASTER PLAYLIST
+            # ------------------------------
             master_url = f"https://vavoo.to/play/{channel_id}/index.m3u8"
-            
-            # 1. Playlist Çözümleme
+
             try:
                 r = requests.get(master_url, headers=HEADERS, timeout=10, verify=False)
-                content, base = r.text, r.url
+                base = r.url
+                content = r.text
+
+                # Variant varsa en üst kaliteyi al
                 if "#EXT-X-STREAM-INF" in content:
-                    match = re.search(r'[\r\n]+([^\r\n]+)', content.split('#EXT-X-STREAM-INF')[1])
-                    if match: 
-                        master_url = resolve_url(base, match.group(1).strip())
+                    m = re.search(r'#EXT-X-STREAM-INF.*\n(.+)', content)
+                    if m:
+                        master_url = resolve_url(base, m.group(1).strip())
             except:
                 return
 
-            # 2. Arka Plan İşçisi (Vavoo'yu sömüren kısım)
+            segment_duration = 2.0
+
+            # ------------------------------
+            # PREFETCH WORKER
+            # ------------------------------
             def prefetch_worker():
-                nonlocal master_url
-                fails = 0
-                while fails < 20:
+                nonlocal segment_duration
+                while True:
                     try:
-                        r_m = requests.get(master_url, headers=HEADERS, timeout=7, verify=False)
-                        if r_m.status_code != 200: raise Exception()
-                        
-                        lines = r_m.text.splitlines()
-                        for line in lines:
+                        pl = requests.get(master_url, headers=HEADERS, timeout=10, verify=False)
+                        lines = pl.text.splitlines()
+
+                        segments = []
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXTINF"):
+                                try:
+                                    segment_duration = float(line.split(':')[1].split(',')[0])
+                                except:
+                                    pass
                             if line and not line.startswith("#"):
-                                ts_url = resolve_url(r_m.url, line)
-                                name = urlparse(ts_url).path.split('/')[-1]
-                                
-                                if name not in played_segments:
-                                    # Segmenti indirirken 2 paralel istek at (En hızlıyı al)
-                                    segment_data = [None]
-                                    def download_attempt():
-                                        try:
-                                            # Zaman aşımını uzun tutuyoruz ki yavaş da olsa insin
-                                            res = requests.get(ts_url, headers=HEADERS, timeout=15, verify=False)
-                                            if res.status_code == 200 and segment_data[0] is None:
-                                                segment_data[0] = res.content
-                                        except: pass
+                                segments.append(resolve_url(pl.url, line))
 
-                                    t1 = threading.Thread(target=download_attempt)
-                                    t2 = threading.Thread(target=download_attempt)
-                                    t1.start(); t2.start()
-                                    t1.join(timeout=16); t2.join(timeout=1) # Bekleme süresi
+                        for ts_url in segments:
+                            name = urlparse(ts_url).path.split('/')[-1]
+                            if name in played_segments:
+                                continue
 
-                                    if segment_data[0]:
-                                        # RAM'e koy (Kuyruk doluysa boşalana kadar bekle)
-                                        buffer_queue.put(segment_data[0], timeout=60)
-                                        played_segments.add(name)
-                                        if len(played_segments) > 60:
-                                            # Bellek yönetimi: listedeki en eski ismi sil
-                                            played_segments.remove(next(iter(played_segments)))
-                        
-                        fails = 0
-                        time.sleep(1) # Playlist yenileme hızı
-                    except Exception:
-                        fails += 1
+                            try:
+                                rts = requests.get(ts_url, headers=HEADERS, timeout=15, verify=False)
+                                if rts.status_code == 200:
+                                    buffer_queue.put(rts.content)
+                                    played_segments.append(name)
+                            except:
+                                pass
+
+                        time.sleep(max(segment_duration * 0.8, 1))
+
+                    except:
                         time.sleep(2)
 
-            # İşçiyi hemen başlat
-            worker_thread = threading.Thread(target=prefetch_worker, daemon=True)
-            worker_thread.start()
+            # Worker başlat
+            threading.Thread(target=prefetch_worker, daemon=True).start()
 
-            # 3. İstemciye (VLC) RAM'den Veri Akışı
+            # ------------------------------
+            # CLIENT STREAM
+            # ------------------------------
             while True:
                 try:
-                    # Kuyrukta hazır bekleyen segmenti al ve gönder
-                    chunk = buffer_queue.get(timeout=45) 
+                    chunk = buffer_queue.get(timeout=60)
                     yield chunk
                 except queue.Empty:
-                    # Eğer Vavoo o kadar yavaşsa ki kuyruk boşaldıysa...
-                    break 
+                    # Donma yerine bekle
+                    time.sleep(1)
+                    continue
 
-        return Response(stream_with_context(generate()), content_type='video/mp2t')
+        return Response(
+            stream_with_context(stream_generator()),
+            content_type='video/mp2t',
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
+    # ==================================================
+    # PLAYLIST MODE
+    # ==================================================
     else:
-        # Liste Kısmı (Aynı kalıyor)
         try:
-            r = requests.get('https://vavoo.to/live2/index', headers={"User-Agent": UA}, timeout=20, verify=False)
-            json_data = r.text
-        except: return "Liste Hatasi"
-            
+            r = requests.get(
+                "https://vavoo.to/live2/index",
+                headers={"User-Agent": UA},
+                timeout=20,
+                verify=False
+            )
+            data = r.text
+        except:
+            return "LIST ERROR"
+
         output = "#EXTM3U\n"
-        pattern = r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"'
-        matches = re.finditer(pattern, json_data, re.IGNORECASE | re.DOTALL)
         base_self = request.base_url.rstrip('/')
-        for m in matches:
+
+        pattern = r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"'
+        for m in re.finditer(pattern, data, re.IGNORECASE | re.DOTALL):
             name = m.group(1).encode().decode('unicode_escape').replace(',', '')
             id_match = re.search(r'/play/(\d+)', m.group(2))
             if id_match:
-                output += f'#EXTINF:-1 group-title="Turkey",{name}\n{base_self}?id={id_match.group(1)}\n'
+                output += f'#EXTINF:-1 group-title="Turkey",{name}\n'
+                output += f'{base_self}?id={id_match.group(1)}\n'
+
         return Response(output, content_type='application/x-mpegURL')
 
+# ======================================================
+# RUN
+# ======================================================
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
