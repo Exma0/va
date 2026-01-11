@@ -1,13 +1,13 @@
 # =====================================================
-# GEVENT YAMASI (EN ÜSTTE OLMALI)
+# GEVENT YAMASI (EN ÜSTTE)
 # =====================================================
 from gevent import monkey
 monkey.patch_all()
 
 import re
 import requests
-import time
 import sys
+import time
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import urljoin, quote, unquote
 
@@ -16,46 +16,38 @@ app = Flask(__name__)
 # =====================================================
 # AYARLAR
 # =====================================================
-# VLC'nin kendi User-Agent'ını kullanmak bazen Vavoo'yu şaşırtır, 
-# ama Chrome taklidi yapmak en garantisidir.
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
+# Ortak Headerlar (Referer ŞARTTIR)
 HEADERS = {
     "User-Agent": UA,
     "Referer": "https://vavoo.to/",
     "Origin": "https://vavoo.to",
-    "Connection": "keep-alive"
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site"
 }
 
 requests.packages.urllib3.disable_warnings()
 
-# Bağlantı Havuzu
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100, 
-    pool_maxsize=100, 
-    max_retries=3
-)
-session.mount('http://', adapter)
-session.mount('https://', adapter)
-
 # =====================================================
-# ROTA 1: ANA LİSTE
+# ROTA 1: KANAL LİSTESİ
 # =====================================================
 @app.route('/')
 def root():
     try:
-        r = session.get("https://vavoo.to/live2/index", headers=HEADERS, verify=False, timeout=15)
-        r.raise_for_status() # Hata varsa dur
+        # Liste için tek kullanımlık istek atıyoruz (Session yok)
+        r = requests.get("https://vavoo.to/live2/index", headers=HEADERS, verify=False, timeout=15)
         data = r.text
     except Exception as e:
-        print(f"Vavoo Liste Hatası: {e}", file=sys.stderr)
-        return "Kaynak Hatasi", 502
+        return f"Liste Hatasi: {str(e)}", 500
 
     base_url = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
     
-    # Kanal Listesi Regex
+    # Kanal ismini ve ID'yi al
     pattern = re.compile(r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"', re.DOTALL)
     
     for m in pattern.finditer(data):
@@ -63,91 +55,107 @@ def root():
         id_match = re.search(r'/play/(\d+)', m.group(2))
         if id_match:
             cid = id_match.group(1)
+            # Linki bizim proxy'ye yönlendir
             out.append(f'#EXTINF:-1 group-title="Turkey",{name}\n{base_url}/playlist/{cid}.m3u8')
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
 # =====================================================
-# ROTA 2: PLAYLIST DÜZENLEYİCİ
+# ROTA 2: M3U8 OLUŞTURUCU (AKILLI PROXY)
 # =====================================================
 @app.route('/playlist/<cid>.m3u8')
 def playlist_proxy(cid):
     vavoo_url = f"https://vavoo.to/play/{cid}/index.m3u8"
     
     try:
-        # Vavoo'dan listeyi çek
-        r = session.get(vavoo_url, headers=HEADERS, verify=False, timeout=8)
-        if r.status_code != 200:
-            print(f"Playlist Hatası {r.status_code}: {cid}", file=sys.stderr)
-            return Response("Yayin Yok", status=404)
-            
+        # 1. M3U8'i çek (Redirectleri takip et)
+        r = requests.get(vavoo_url, headers=HEADERS, verify=False, timeout=10, allow_redirects=True)
+        if r.status_code != 200: return Response("Yayin Kapali", status=404)
+        
+        final_url = r.url # Yönlendirme varsa son adresi al
         content = r.text
         
-        # Master Playlist ise en iyi kaliteyi bul
+        # 2. Master Playlist Kontrolü (Kalite Seçimi)
         if "#EXT-X-STREAM-INF" in content:
             lines = content.splitlines()
             for line in reversed(lines):
                 if line and not line.startswith("#"):
-                    real_url = urljoin(vavoo_url, line)
+                    final_url = urljoin(final_url, line)
                     # Gerçek yayına git
-                    r = session.get(real_url, headers=HEADERS, verify=False, timeout=8)
+                    r = requests.get(final_url, headers=HEADERS, verify=False, timeout=10)
                     content = r.text
-                    vavoo_url = real_url
                     break
 
-        base_ts_url = vavoo_url.rsplit('/', 1)[0] + '/'
+        base_ts_url = final_url.rsplit('/', 1)[0] + '/'
         new_lines = []
         
+        # 3. Satırları işle ve Proxy linkine çevir
         for line in content.splitlines():
             line = line.strip()
             if not line: continue
             
             if line.startswith("#"):
                 new_lines.append(line)
+                # Donma önleyici buffer (15 sn)
+                if "#EXT-X-TARGETDURATION" in line:
+                    new_lines.append("#EXT-X-START:TIME-OFFSET=-15")
             else:
-                # Segment URL'sini hazırla
+                # Segment URL'sini tam hale getir
                 full_ts_url = urljoin(base_ts_url, line)
-                # URL'yi güvenli hale getir (Encoded)
-                safe_url = quote(full_ts_url)
+                
+                # URL'yi güvenli şekilde paketle (Quote)
+                # Buradaki quote işlemi linkin bozulmasını engeller
+                encoded_url = quote(full_ts_url)
+                
                 # Proxy linkini oluştur
-                new_lines.append(f"{request.host_url.rstrip('/')}/seg?url={safe_url}")
+                new_lines.append(f"{request.host_url.rstrip('/')}/seg?url={encoded_url}")
         
         return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
 
     except Exception as e:
-        print(f"Playlist Exception: {e}", file=sys.stderr)
+        print(f"Playlist Error: {e}", file=sys.stderr)
         return Response("Server Error", status=500)
 
 # =====================================================
-# ROTA 3: SEGMENT PROXY (HATA YUTMAZ)
+# ROTA 3: SEGMENT PROXY (GLOBAL SESSION YOK!)
 # =====================================================
 @app.route('/seg')
 def segment_proxy():
+    # URL'yi paketten çıkar
     target_url = unquote(request.args.get('url'))
     if not target_url: return "No URL", 400
 
     def generate():
         try:
-            # stream=True ile açıyoruz
-            with session.get(target_url, headers=HEADERS, verify=False, stream=True, timeout=15) as r:
+            # KRİTİK NOKTA: Burada global 'session' YERİNE
+            # 'requests.get' kullanıyoruz. Bu her parça için taze bir
+            # bağlantı açar. Thread çakışmasını engeller.
+            
+            # Timeout değerini artırdık (Vavoo bazen geç yanıt verir)
+            with requests.get(
+                target_url, 
+                headers=HEADERS, 
+                verify=False, 
+                stream=True, 
+                timeout=20 
+            ) as r:
                 
-                # ÖNEMLİ: Vavoo 200 vermezse (403, 404, 500), biz de hata dönelim.
-                # Böylece VLC "0 byte" almaz, hata alır ve tekrar dener.
+                # Eğer Vavoo hata verirse (403/404), biz de hata verelim ki
+                # VLC "0 byte" indirmesin, tekrar denesin.
                 if r.status_code != 200:
-                    print(f"Segment Hatası {r.status_code}: {target_url}", file=sys.stderr)
-                    # Hata kodu göndererek VLC'ye "Bu parça bozuk, diğerine geç" diyoruz
+                    # Loglara hata bas
+                    print(f"TS Error {r.status_code}: {target_url}", file=sys.stderr)
                     return 
 
-                # Veri akışı
+                # Veriyi 64KB'lık paketlerle aktar
                 for chunk in r.iter_content(chunk_size=65536):
                     if chunk: yield chunk
                     
         except Exception as e:
-            # Bağlantı koparsa sessizce bitir, VLC anlar.
-            print(f"Download Error: {e}", file=sys.stderr)
+            # Bağlantı koptuysa sessizce çık
             return
 
-    # Response içinde direct_passthrough kullanarak Flask'ın araya girmesini engelliyoruz
+    # Direct passthrough headers
     return Response(stream_with_context(generate()), content_type="video/mp2t")
 
 if __name__ == "__main__":
