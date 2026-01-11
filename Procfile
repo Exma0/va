@@ -1,1 +1,1 @@
-gunicorn -w 4 -k gevent --worker-connections 1000 --timeout 120 --bind 0.0.0.0:5000 main:app
+gunicorn -k gthread -w 4 --threads 4 main:app
