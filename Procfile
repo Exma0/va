@@ -1,1 +1,1 @@
-gunicorn -k gthread -w 4 --threads 4 main:app
+gunicorn -k gevent -w 4 --timeout 120 main:app
