@@ -17,8 +17,8 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-RAM_SEGMENTS = 30      # ~30 segment ≈ 60–90 sn (Render RAM’e göre ayarla)
-DEFAULT_START = 10     # VLC EXT-X-START (sn)
+RAM_SEGMENTS = 30
+DEFAULT_START = 10
 
 # ======================================================
 # SHARED STREAM (RAM ONLY)
@@ -28,7 +28,7 @@ class SharedStream:
         self.cid = cid
         self.master = f"https://vavoo.to/play/{cid}/index.m3u8"
         self.seg_dur = 2.0
-        self.buffer = deque(maxlen=RAM_SEGMENTS)  # [(name,data)]
+        self.buffer = deque(maxlen=RAM_SEGMENTS)
         self.lock = threading.Lock()
         self.running = False
 
@@ -42,7 +42,6 @@ class SharedStream:
     def worker(self):
         self.resolve_master()
         seen = set()
-
         while True:
             try:
                 pl = requests.get(self.master, headers=HEADERS, timeout=10, verify=False)
@@ -57,13 +56,11 @@ class SharedStream:
                         name = urlparse(ts).path.split('/')[-1]
                         if name in seen:
                             continue
-
                         rts = requests.get(ts, headers=HEADERS, timeout=15, verify=False)
                         if rts.status_code == 200:
                             with self.lock:
                                 self.buffer.append((name, rts.content))
                             seen.add(name)
-
                 time.sleep(max(self.seg_dur * 0.8, 1))
             except:
                 time.sleep(2)
@@ -74,7 +71,7 @@ class SharedStream:
             threading.Thread(target=self.worker, daemon=True).start()
 
 # ======================================================
-# REGISTRY
+# STREAM REGISTRY
 # ======================================================
 STREAMS = {}
 LOCK = threading.Lock()
@@ -87,73 +84,9 @@ def get_stream(cid):
         return STREAMS[cid]
 
 # ======================================================
-# VLC HLS-LIKE PLAYLIST (EXT-X-START)
+# ROOT PLAYLIST (DIRECT M3U)
 # ======================================================
-@app.route('/channel.m3u8')
-def channel():
-    cid = request.args.get('id')
-    start = int(request.args.get('start', DEFAULT_START))
-    if not cid:
-        return "NO ID"
-
-    get_stream(cid)
-
-    m3u = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        f"#EXT-X-START:TIME-OFFSET=-{start},PRECISE=YES",
-        "#EXT-X-TARGETDURATION:5",
-        "#EXT-X-MEDIA-SEQUENCE:0",
-        f"{request.host_url.rstrip('/')}/stream.ts?id={cid}&shift={start}"
-    ]
-
-    return Response("\n".join(m3u), content_type="application/x-mpegURL")
-
-# ======================================================
-# TS STREAM (RAM BUFFER + DVR)
-# ======================================================
-@app.route('/stream.ts')
-def stream_ts():
-    cid = request.args.get('id')
-    shift = int(request.args.get('shift', 0))
-    if not cid:
-        return "NO ID"
-
-    s = get_stream(cid)
-
-    def generate():
-        with s.lock:
-            back = int(shift / max(s.seg_dur, 1))
-            start = max(len(s.buffer) - back, 0)
-            play = list(s.buffer)[start:]
-
-        sent = set()
-        for name, data in play:
-            sent.add(name)
-            yield data
-
-        while True:
-            with s.lock:
-                for name, data in list(s.buffer):
-                    if name not in sent:
-                        sent.add(name)
-                        yield data
-            time.sleep(0.2)
-
-    return Response(
-        stream_with_context(generate()),
-        content_type="video/mp2t",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-# ======================================================
-# AUTOMATIC VLC PLAYLIST
-# ======================================================
-@app.route('/playlist.m3u')
+@app.route('/')
 def playlist():
     start = int(request.args.get('start', DEFAULT_START))
     try:
@@ -179,6 +112,68 @@ def playlist():
             out += f'{base}/channel.m3u8?id={mid.group(1)}&start={start}\n'
 
     return Response(out, content_type="application/x-mpegURL")
+
+# ======================================================
+# VLC EXT-X-START PLAYLIST
+# ======================================================
+@app.route('/channel.m3u8')
+def channel():
+    cid = request.args.get('id')
+    start = int(request.args.get('start', DEFAULT_START))
+    if not cid:
+        return "NO ID"
+
+    get_stream(cid)
+
+    m3u = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-START:TIME-OFFSET=-{start},PRECISE=YES",
+        "#EXT-X-TARGETDURATION:5",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"{request.host_url.rstrip('/')}/stream.ts?id={cid}&shift={start}"
+    ]
+
+    return Response("\n".join(m3u), content_type="application/x-mpegURL")
+
+# ======================================================
+# TS STREAM
+# ======================================================
+@app.route('/stream.ts')
+def stream_ts():
+    cid = request.args.get('id')
+    shift = int(request.args.get('shift', 0))
+    if not cid:
+        return "NO ID"
+
+    s = get_stream(cid)
+
+    def generate():
+        with s.lock:
+            back = int(shift / max(s.seg_dur, 1))
+            start = max(len(s.buffer) - back, 0)
+            play = list(s.buffer)[start:]
+        sent = set()
+        for name, data in play:
+            sent.add(name)
+            yield data
+        while True:
+            with s.lock:
+                for name, data in list(s.buffer):
+                    if name not in sent:
+                        sent.add(name)
+                        yield data
+            time.sleep(0.2)
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="video/mp2t",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 # ======================================================
 # RUN
