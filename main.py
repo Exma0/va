@@ -1,8 +1,14 @@
-import re, time, threading, requests
+import re
+import time
+import threading
+import requests
 from collections import deque
 from urllib.parse import urljoin, urlparse
 from flask import Flask, Response, request, stream_with_context
 
+# ======================================================
+# APP (Render için kritik)
+# ======================================================
 app = Flask(__name__)
 requests.packages.urllib3.disable_warnings()
 
@@ -17,11 +23,11 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-RAM_SEGMENTS = 30
-DEFAULT_START = 10
+RAM_SEGMENTS = 30        # Render Free için güvenli
+DEFAULT_START = 10       # VLC EXT-X-START (sn)
 
 # ======================================================
-# SHARED STREAM (RAM ONLY)
+# SHARED STREAM (RAM ONLY – RENDER SAFE)
 # ======================================================
 class SharedStream:
     def __init__(self, cid):
@@ -84,11 +90,12 @@ def get_stream(cid):
         return STREAMS[cid]
 
 # ======================================================
-# ROOT PLAYLIST (DIRECT M3U)
+# ROOT → DIRECT M3U LIST (İSTEDİĞİN ŞEY)
 # ======================================================
-@app.route('/')
-def playlist():
+@app.route('/', methods=['GET'])
+def root_playlist():
     start = int(request.args.get('start', DEFAULT_START))
+
     try:
         r = requests.get(
             "https://vavoo.to/live2/index",
@@ -98,7 +105,7 @@ def playlist():
         )
         data = r.text
     except:
-        return "LIST ERROR"
+        return Response("LIST ERROR", status=500)
 
     base = request.host_url.rstrip('/')
     out = "#EXTM3U\n"
@@ -116,12 +123,12 @@ def playlist():
 # ======================================================
 # VLC EXT-X-START PLAYLIST
 # ======================================================
-@app.route('/channel.m3u8')
+@app.route('/channel.m3u8', methods=['GET'])
 def channel():
     cid = request.args.get('id')
     start = int(request.args.get('start', DEFAULT_START))
     if not cid:
-        return "NO ID"
+        return "NO ID", 400
 
     get_stream(cid)
 
@@ -137,14 +144,14 @@ def channel():
     return Response("\n".join(m3u), content_type="application/x-mpegURL")
 
 # ======================================================
-# TS STREAM
+# TS STREAM (RAM BUFFER)
 # ======================================================
-@app.route('/stream.ts')
+@app.route('/stream.ts', methods=['GET'])
 def stream_ts():
     cid = request.args.get('id')
     shift = int(request.args.get('shift', 0))
     if not cid:
-        return "NO ID"
+        return "NO ID", 400
 
     s = get_stream(cid)
 
@@ -153,10 +160,12 @@ def stream_ts():
             back = int(shift / max(s.seg_dur, 1))
             start = max(len(s.buffer) - back, 0)
             play = list(s.buffer)[start:]
+
         sent = set()
         for name, data in play:
             sent.add(name)
             yield data
+
         while True:
             with s.lock:
                 for name, data in list(s.buffer):
@@ -176,7 +185,10 @@ def stream_ts():
     )
 
 # ======================================================
-# RUN
+# RENDER ENTRYPOINT (ÇOK ÖNEMLİ)
 # ======================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    # Render portu otomatik verir
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
