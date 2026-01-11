@@ -7,11 +7,8 @@ monkey.patch_all()
 import re
 import requests
 import time
-import json
-import random
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -29,9 +26,14 @@ HEADERS_COMMON = {
 # SSL uyarılarını kapat
 requests.packages.urllib3.disable_warnings()
 
-# Global Session (Bağlantı Havuzu)
+# Global Session (Bağlantı Havuzu - Optimize Edildi)
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500, max_retries=3)
+# Pool size artırıldı, böylece çoklu bağlantılarda tıkanma olmaz
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=1000, 
+    pool_maxsize=1000, 
+    max_retries=3
+)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
@@ -43,42 +45,12 @@ session.mount('https://', adapter)
 def resolve_url(base, rel):
     return urljoin(base, rel)
 
-def fetch_url_race(url, headers):
-    """
-    --- MOTOR 2: RACE & BURST ---
-    Aynı URL'ye 3 farklı thread ile saldırır, ilk gelen veriyi alır.
-    """
-    racer_count = 3
-    
-    def _req(u, h):
-        try:
-            # Race modu için kısa timeout ve SSL doğrulama kapalı
-            with session.get(u, headers=h, verify=False, timeout=5, stream=False) as r:
-                if r.status_code == 200:
-                    return r.content
-        except Exception:
-            pass
-        return None
-
-    # ThreadPool ile yarış başlat
-    with ThreadPoolExecutor(max_workers=racer_count) as executor:
-        futures = [executor.submit(_req, url, headers) for _ in range(racer_count)]
-        
-        for future in as_completed(futures):
-            result = future.result()
-            # Veri doluysa ve boyutu mantıklıysa (1KB+) kazananı döndür
-            if result and len(result) > 1024: 
-                return result
-    return None
-
 def fetch_playlist_data(url):
-    """Playlist verisini çeker"""
+    """Playlist verisini çeker - Timeout düşürüldü"""
     try:
-        h = HEADERS_COMMON.copy()
-        # Cache'i delmek için timestamp ekle
+        # Cache önlemek için timestamp ekliyoruz
         final_url = f"{url}?_={int(time.time())}"
-        
-        r = session.get(final_url, headers=h, verify=False, timeout=4)
+        r = session.get(final_url, headers=HEADERS_COMMON, verify=False, timeout=5)
         return r.text, r.url
     except Exception:
         return None, None
@@ -95,7 +67,7 @@ def main_router():
         return playlist()
 
 def playlist():
-    """ MOD 2: LISTE (FLASH REGEX) """
+    """ KANAL LİSTESİ OLUŞTURUCU (Hızlı Regex Modu) """
     def generate():
         yield "#EXTM3U\n"
         
@@ -104,7 +76,7 @@ def playlist():
                 'https://vavoo.to/live2/index',
                 headers={"User-Agent": UA, "Accept-Encoding": "gzip"},
                 verify=False,
-                timeout=30
+                timeout=15
             )
             json_raw = r.text
         except Exception:
@@ -117,7 +89,7 @@ def playlist():
 
         base_self = request.base_url
 
-        # Regex ile listeyi parse et
+        # Regex ile listeyi parse et (JSON modülünden daha hızlıdır)
         pattern = re.compile(r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"', re.IGNORECASE)
         matches = pattern.finditer(json_raw)
         
@@ -126,10 +98,12 @@ def playlist():
             name_raw = m.group(1).encode().decode('unicode_escape')
             url_raw = m.group(2)
             
+            # URL içinden ID'yi çek
             id_match = re.search(r'/play/(\d+)', url_raw)
             if id_match:
                 stream_id = id_match.group(1)
                 
+                # İsim temizliği
                 name = name_raw.replace('&amp;', '&')
                 name = name.replace(',', '').replace('"', '').replace('\r', '').replace('\n', '')
                 name = re.sub(r'\s*\(\d+\)$', '', name).strip()
@@ -145,7 +119,12 @@ def playlist():
 
 
 def stream_video():
-    """ MOD 1: FUSION OYNATICI """
+    """ 
+    OPTIMIZE EDİLMİŞ STREAM OYNATICI 
+    - Yarış modu (Race) kaldırıldı.
+    - ThreadPool kaldırıldı (CPU yükünü düşürür).
+    - Anlık iletim (Direct Pipe) eklendi.
+    """
     stream_id = request.args.get('id')
     master_url = f"https://vavoo.to/play/{stream_id}/index.m3u8"
     
@@ -158,77 +137,89 @@ def stream_video():
 
     def generate_stream():
         nonlocal master_url
-        played_segments = []
+        played_segments = [] # Oynatılanları hafızada tut
         fails = 0
-        first_run = True
         
         while True:
             try:
+                # Playlist'i çek
                 content, base_url = fetch_playlist_data(master_url)
                 
                 if not content:
                     fails += 1
-                    if fails > 10: break
-                    time.sleep(0.5)
+                    if fails > 5: break # 5 kere üst üste hata verirse çık
+                    time.sleep(1)
                     continue
                 
                 fails = 0
 
-                # Master Playlist kontrolü (Çözünürlük seçimi)
+                # 1. Master Playlist Kontrolü (Kalite Seçimi)
+                # Eğer gelen dosya başka m3u8 linkleri içeriyorsa en iyisini seç
                 if '#EXT-X-STREAM-INF' in content:
                     lines = content.splitlines()
-                    # En iyi kaliteyi bulmaya çalış (sonuncusu genelde en iyidir)
                     best_url = None
-                    for line in lines:
+                    # Genelde listenin sonundaki link en yüksek kalitedir
+                    for line in reversed(lines):
                         if line and not line.startswith('#'):
                             best_url = resolve_url(base_url, line.strip())
+                            break
                     
                     if best_url:
                         master_url = best_url
                         continue
 
+                # 2. Segmentleri Parse Et ve Oynat
                 lines = content.splitlines()
                 found_new = False
-                
-                # Segmentleri işle
+                target_duration = 4.0 # Varsayılan segment süresi
+
                 for line in lines:
                     line = line.strip()
+                    
+                    # Segment süresini yakala
+                    if line.startswith('#EXTINF:'):
+                        try:
+                            target_duration = float(line.split(':')[1].split(',')[0])
+                        except:
+                            pass
+
                     if line and not line.startswith('#'):
                         ts_url = resolve_url(base_url, line)
                         ts_name = urlparse(ts_url).path.split('/')[-1]
                         
+                        # Eğer bu parça daha önce oynatılmadıysa İNDİR ve GÖNDER
                         if ts_name not in played_segments:
-                            # --- MOTOR 1: INSTANT START ---
-                            if first_run:
-                                try:
-                                    with session.get(ts_url, headers=HEADERS_COMMON, verify=False, stream=True, timeout=10) as r:
-                                        if r.status_code == 200:
-                                            for chunk in r.iter_content(chunk_size=16384):
-                                                if chunk: yield chunk
-                                    first_run = False
-                                except: pass
-                            
-                            # --- MOTOR 2: RACE & BURST ---
-                            else:
-                                data = fetch_url_race(ts_url, HEADERS_COMMON)
-                                if data:
-                                    yield data
+                            try:
+                                # stream=True ile veriyi RAM'e yüklemeden anında izleyiciye akıt
+                                with session.get(ts_url, headers=HEADERS_COMMON, verify=False, stream=True, timeout=10) as r:
+                                    if r.status_code == 200:
+                                        # 64KB'lık parçalar halinde gönder (Optimum boyut)
+                                        for chunk in r.iter_content(chunk_size=65536):
+                                            if chunk: yield chunk
+                                            
+                                # Listeye ekle
+                                played_segments.append(ts_name)
+                                # Hafıza şişmesini önlemek için eski kayıtları sil (Son 20 parça yeterli)
+                                if len(played_segments) > 20:
+                                    played_segments.pop(0)
+                                
+                                found_new = True
+                            except Exception:
+                                # İndirme hatası olursa pas geç, bir sonrakini dene
+                                pass
 
-                            played_segments.append(ts_name)
-                            # Bellek şişmesini önle
-                            if len(played_segments) > 50:
-                                played_segments.pop(0)
-                            
-                            found_new = True
-
+                # 3. Akıllı Bekleme Döngüsü
                 if found_new:
-                    if not first_run:
-                        # Donmayı önlemek için akıllı bekleme (Segment süresi kadar değil, biraz azı)
-                        time.sleep(3.5) 
+                    # Eğer yeni parça bulduysak, canlı yayının ilerlemesi için beklemiyoruz.
+                    # Çünkü video oynatılırken geçen süre zaten bekleme yerine geçer.
+                    # Sadece çok hafif bir nefes alma süresi.
+                    pass 
                 else:
-                    time.sleep(1.0)
+                    # Yeni parça yoksa, sunucuyu yormamak için segment süresinin yarısı kadar bekle
+                    time.sleep(target_duration / 2)
             
             except GeneratorExit:
+                # İstemci (VLC) bağlantıyı keserse döngüyü kır
                 break
             except Exception:
                 time.sleep(1)
@@ -236,4 +227,5 @@ def stream_video():
     return Response(stream_with_context(generate_stream()), headers=resp_headers)
 
 if __name__ == '__main__':
+    # Threaded mod performans için şarttır
     app.run(host='0.0.0.0', port=8080, threaded=True)
