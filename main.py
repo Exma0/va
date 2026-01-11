@@ -1,11 +1,8 @@
-import os, re, time, threading, requests
+import re, time, threading, requests
 from collections import deque
 from urllib.parse import urljoin, urlparse
 from flask import Flask, Response, request, stream_with_context
 
-# ======================================================
-# APP
-# ======================================================
 app = Flask(__name__)
 requests.packages.urllib3.disable_warnings()
 
@@ -20,27 +17,20 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-BASE_DIR = "/tmp/vavoo_buf"
-RAM_SEGMENTS = 15
-DISK_SEGMENTS = 180   # ~3–6 dk
-DEFAULT_START = 10    # VLC için varsayılan EXT-X-START (sn)
-
-os.makedirs(BASE_DIR, exist_ok=True)
+RAM_SEGMENTS = 30      # ~30 segment ≈ 60–90 sn (Render RAM’e göre ayarla)
+DEFAULT_START = 10     # VLC EXT-X-START (sn)
 
 # ======================================================
-# SHARED STREAM (MULTI CLIENT)
+# SHARED STREAM (RAM ONLY)
 # ======================================================
 class SharedStream:
     def __init__(self, cid):
         self.cid = cid
         self.master = f"https://vavoo.to/play/{cid}/index.m3u8"
         self.seg_dur = 2.0
-        self.ram = deque(maxlen=RAM_SEGMENTS)      # [(name,data)]
-        self.disk_index = deque(maxlen=DISK_SEGMENTS)
+        self.buffer = deque(maxlen=RAM_SEGMENTS)  # [(name,data)]
         self.lock = threading.Lock()
         self.running = False
-        self.path = os.path.join(BASE_DIR, cid)
-        os.makedirs(self.path, exist_ok=True)
 
     def resolve_master(self):
         r = requests.get(self.master, headers=HEADERS, timeout=10, verify=False)
@@ -51,6 +41,8 @@ class SharedStream:
 
     def worker(self):
         self.resolve_master()
+        seen = set()
+
         while True:
             try:
                 pl = requests.get(self.master, headers=HEADERS, timeout=10, verify=False)
@@ -63,17 +55,15 @@ class SharedStream:
                     if line and not line.startswith("#"):
                         ts = urljoin(pl.url, line)
                         name = urlparse(ts).path.split('/')[-1]
-                        with self.lock:
-                            if name in self.disk_index:
-                                continue
+                        if name in seen:
+                            continue
+
                         rts = requests.get(ts, headers=HEADERS, timeout=15, verify=False)
                         if rts.status_code == 200:
-                            data = rts.content
                             with self.lock:
-                                self.ram.append((name, data))
-                                with open(os.path.join(self.path, name), "wb") as f:
-                                    f.write(data)
-                                self.disk_index.append(name)
+                                self.buffer.append((name, rts.content))
+                            seen.add(name)
+
                 time.sleep(max(self.seg_dur * 0.8, 1))
             except:
                 time.sleep(2)
@@ -97,19 +87,17 @@ def get_stream(cid):
         return STREAMS[cid]
 
 # ======================================================
-# HLS-LIKE PLAYLIST (VLC EXT-X-START)
+# VLC HLS-LIKE PLAYLIST (EXT-X-START)
 # ======================================================
 @app.route('/channel.m3u8')
-def channel_playlist():
+def channel():
     cid = request.args.get('id')
+    start = int(request.args.get('start', DEFAULT_START))
     if not cid:
         return "NO ID"
 
-    start = int(request.args.get('start', DEFAULT_START))
-    s = get_stream(cid)
+    get_stream(cid)
 
-    # VLC için EXT-X-START negatif offset
-    # (-10 = 10 sn geriden)
     m3u = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -122,7 +110,7 @@ def channel_playlist():
     return Response("\n".join(m3u), content_type="application/x-mpegURL")
 
 # ======================================================
-# TS STREAM (BUFFER + DVR)
+# TS STREAM (RAM BUFFER + DVR)
 # ======================================================
 @app.route('/stream.ts')
 def stream_ts():
@@ -134,24 +122,19 @@ def stream_ts():
     s = get_stream(cid)
 
     def generate():
-        # -------- DVR (diskten geriden) --------
         with s.lock:
             back = int(shift / max(s.seg_dur, 1))
-            start = max(len(s.disk_index) - back, 0)
-            play = list(s.disk_index)[start:]
+            start = max(len(s.buffer) - back, 0)
+            play = list(s.buffer)[start:]
 
-        for name in play:
-            fp = os.path.join(s.path, name)
-            if os.path.exists(fp):
-                with open(fp, "rb") as f:
-                    yield f.read()
+        sent = set()
+        for name, data in play:
+            sent.add(name)
+            yield data
 
-        sent = set(play)
-
-        # -------- canlı RAM --------
         while True:
             with s.lock:
-                for name, data in list(s.ram):
+                for name, data in list(s.buffer):
                     if name not in sent:
                         sent.add(name)
                         yield data
