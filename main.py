@@ -2,6 +2,7 @@ import requests
 import re
 import time
 import threading
+import queue
 from urllib.parse import urljoin, urlparse
 from flask import Flask, Response, request, stream_with_context
 
@@ -9,144 +10,103 @@ app = Flask(__name__)
 requests.packages.urllib3.disable_warnings()
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-HEADERS = {
-    "User-Agent": UA,
-    "Referer": "https://vavoo.to/",
-    "Connection": "keep-alive"
-}
+HEADERS = {"User-Agent": UA, "Referer": "https://vavoo.to/", "Connection": "keep-alive"}
 
 def resolve_url(base, rel):
     return urljoin(base, rel)
 
-# --- MOTOR 1: INSTANT START (PHP stream_direct_pipe karşılığı) ---
-def stream_direct(url):
-    try:
-        with requests.get(url, headers=HEADERS, stream=True, timeout=5, verify=False) as r:
-            for chunk in r.iter_content(chunk_size=16384):
-                if chunk:
-                    yield chunk
-    except:
-        pass
-
-# --- MOTOR 2: RACE & BURST (PHP download_race_burst karşılığı) ---
-def download_race_burst(url):
-    """3 farklı kanaldan veriyi ister, ilk bitenden veriyi alır."""
-    winner_data = [None]
-    event = threading.Event()
-
-    def racer():
+# --- AKILLI SEGMENT İNDİRİCİ (RACE + RETRY) ---
+def fetch_segment(url):
+    """Segmenti çekmek için 2 paralel deneme yapar (Race Condition)."""
+    result = [None]
+    def download():
         try:
-            # Taze bağlantı için session kullanmıyoruz (PHP Fresh Connect mantığı)
-            r = requests.get(url, headers=HEADERS, timeout=6, verify=False)
+            r = requests.get(url, headers=HEADERS, timeout=8, verify=False)
             if r.status_code == 200 and len(r.content) > 1024:
-                if not event.is_set():
-                    winner_data[0] = r.content
-                    event.set()
-        except:
-            pass
+                if result[0] is None: result[0] = r.content
+        except: pass
 
-    threads = []
-    for _ in range(3): # 3 sunucuyla yarış
-        t = threading.Thread(target=racer)
-        t.start()
-        threads.append(t)
-
-    # Maksimum 6 saniye bekle veya biri bitene kadar dur
-    event.wait(timeout=6)
-    return winner_data[0]
-
-def get_playlist(url):
-    try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=5, verify=False)
-        return r.text, r.url
-    except:
-        return None, None
+    threads = [threading.Thread(target=download) for _ in range(2)]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=9)
+    return result[0]
 
 @app.route('/')
 def main_controller():
     channel_id = request.args.get('id')
     
-    # --- MOD 1: FUSION OYNATICI ---
     if channel_id:
         def generate():
             master_url = f"https://vavoo.to/play/{channel_id}/index.m3u8"
             played_segments = []
-            first_run = True
+            buffer_queue = queue.Queue(maxsize=5) # Arka planda 5 segment biriktirir
+            
+            # 1. Playlist Çözümleme
+            r = requests.get(master_url, headers=HEADERS, timeout=5, verify=False)
+            content, base = r.text, r.url
+            if "#EXT-X-STREAM-INF" in content:
+                match = re.search(r'[\r\n]+([^\r\n]+)', content.split('#EXT-X-STREAM-INF')[1])
+                if match: 
+                    master_url = resolve_url(base, match.group(1).strip())
 
-            while True:
-                content, base = get_playlist(master_url)
-                if not content:
-                    time.sleep(1)
-                    continue
-                
-                # Master/Varyant kontrolü
-                if "#EXT-X-STREAM-INF" in content:
-                    match = re.search(r'[\r\n]+([^\r\n]+)', content.split('#EXT-X-STREAM-INF')[1])
-                    if match:
-                        master_url = resolve_url(base, match.group(1).strip())
-                        continue
+            # 2. ARKA PLAN İŞÇİSİ (Pre-fetcher)
+            # Sen izlerken o bir sonraki parçaları RAM'e doldurur
+            def worker():
+                while True:
+                    try:
+                        r_m = requests.get(master_url, headers=HEADERS, timeout=5, verify=False)
+                        lines = r_m.text.splitlines()
+                        for line in lines:
+                            if line and not line.startswith("#"):
+                                ts_url = resolve_url(r_m.url, line)
+                                name = urlparse(ts_url).path.split('/')[-1]
+                                
+                                if name not in played_segments:
+                                    data = fetch_segment(ts_url)
+                                    if data:
+                                        buffer_queue.put(data, timeout=15)
+                                        played_segments.append(name)
+                                        if len(played_segments) > 40: played_segments.pop(0)
+                        time.sleep(1)
+                    except: time.sleep(2)
 
-                lines = content.splitlines()
-                dur = 4.0
-                found_new = False
+            # İşçiyi başlat
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
 
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith("#EXTINF:"):
-                        try:
-                            dur = float(re.findall(r"[-+]?\d*\.\d+|\d+", line)[0])
-                        except: dur = 4.0
-                    
-                    if line and not line.startswith("#"):
-                        ts_url = resolve_url(base, line)
-                        name = urlparse(ts_url).path.split('/')[-1]
-
-                        if name not in played_segments:
-                            if first_run:
-                                # FAZ 1: İLK AÇILIŞ (Hız Odaklı)
-                                for chunk in stream_direct(ts_url):
-                                    yield chunk
-                                first_run = False
-                            else:
-                                # FAZ 2: DEVAMLILIK (Race & Burst)
-                                data = download_race_burst(ts_url)
-                                if data:
-                                    yield data
-                            
-                            played_segments.append(name)
-                            found_new = True
-                            if len(played_segments) > 40:
-                                played_segments.pop(0)
-                
-                if found_new:
-                    # PHP: usleep((int)($dur * 0.85 * 1000000))
-                    time.sleep(dur * 0.7) 
-                else:
+            # 3. VERİ AKIŞI (Consumer)
+            # Kuyruktaki verileri oynatıcıya (VLC) basar
+            consecutive_fails = 0
+            while consecutive_fails < 20:
+                try:
+                    # Kuyruktan veriyi al (VLC'ye gönder)
+                    # 15 saniye içinde veri gelmezse döngü kırılır
+                    chunk = buffer_queue.get(timeout=20) 
+                    yield chunk
+                    consecutive_fails = 0
+                except queue.Empty:
+                    consecutive_fails += 1
                     time.sleep(0.5)
 
         return Response(stream_with_context(generate()), content_type='video/mp2t')
 
-    # --- MOD 2: LISTE (Flash Regex) ---
     else:
+        # Liste Oluşturma (Turkey kanalları)
         try:
-            r = requests.get('https://vavoo.to/live2/index', headers={"User-Agent": UA}, timeout=20, verify=False)
+            r = requests.get('https://vavoo.to/live2/index', headers={"User-Agent": UA}, timeout=15, verify=False)
             json_raw = r.text
-        except:
-            return "#EXTM3U\n#EXTINF:-1,HATA: Liste Alinamadi\n"
+        except: return "Hata"
             
         output = "#EXTM3U\n"
         pattern = r'"group":"Turkey".*?"name":"([^"]+)".*?"url":"([^"]+)"'
         matches = re.finditer(pattern, json_raw, re.IGNORECASE | re.DOTALL)
-        
         base_self = request.base_url.rstrip('/')
-        
         for m in matches:
             name = m.group(1).encode().decode('unicode_escape')
             name = re.sub(r'[,"\r\n]', '', name).strip()
             id_match = re.search(r'/play/(\d+)', m.group(2))
             if id_match:
                 output += f'#EXTINF:-1 group-title="Turkey",{name}\n{base_self}?id={id_match.group(1)}\n'
-        
         return Response(output, content_type='application/x-mpegURL')
 
 if __name__ == '__main__':
