@@ -9,18 +9,16 @@ from functools import lru_cache
 app = Flask(__name__)
 requests.packages.urllib3.disable_warnings()
 
-# Bağlantı havuzunu ve bekleme sürelerini optimize et
 session = requests.Session()
 session.verify = False
 adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500, max_retries=3)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# Vavoo'nun gerçek cihaz gibi görmesi için daha detaylı header
+UA = 'VAVOO/2.6'
 HEADERS = {
-    "User-Agent": "VAVOO/2.6",
+    "User-Agent": UA,
     "Accept": "*/*",
-    "Range": "bytes=0-",
     "Connection": "keep-alive",
     "Referer": "https://vavoo.to/"
 }
@@ -37,7 +35,6 @@ def resolve_url(url):
         r = session.get(url, headers=HEADERS, timeout=5)
         if "#EXT-X-STREAM-INF" in r.text:
             lines = r.text.splitlines()
-            # En yüksek kaliteyi (genelde en alt satırdaki link) seç
             streams = [l.strip() for l in lines if l and not l.startswith("#")]
             return urljoin(url, streams[-1]) if streams else url
         return url
@@ -53,7 +50,7 @@ def root_playlist():
         r = session.get("https://vavoo.to/live2/index", headers=HEADERS, timeout=10)
         data = r.text
     except:
-        return "ERROR", 500
+        return "ERR", 500
     base = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
     for m in CHANNEL_REGEX.finditer(data):
@@ -79,8 +76,7 @@ def live_m3u8():
             if line.startswith("#"):
                 new_lines.append(line)
                 if "#EXT-X-TARGETDURATION" in line:
-                    # Buffer'ı artırmak için başlangıç ofsetini büyüttük
-                    new_lines.append("#EXT-X-START:TIME-OFFSET=-20")
+                    new_lines.append("#EXT-X-START:TIME-OFFSET=-40")
             elif line.strip():
                 ts_url = urljoin(base_url, line.strip())
                 new_lines.append(f"{request.host_url.rstrip('/')}/ts_proxy?url={ts_url}")
@@ -93,11 +89,9 @@ def ts_proxy():
     ts_url = request.args.get('url')
     def generate():
         try:
-            # Stream timeout'u artırıldı ve chunk boyutu optimize edildi
-            with session.get(ts_url, headers=HEADERS, stream=True, timeout=15) as r:
-                # Vavoo 200 harici dönerse veri gönderme (Hatalı 207 byte'ı önler)
+            with session.get(ts_url, headers=HEADERS, stream=True, timeout=20) as r:
                 if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=16384):
+                    for chunk in r.iter_content(chunk_size=32768):
                         yield chunk
         except:
             pass
