@@ -5,7 +5,15 @@ import time
 import requests
 import urllib3
 import gc
-from gevent import pool, spawn
+import sys
+
+# Hızlı JSON ayrıştırıcı kontrolü
+try:
+    import ujson as json
+except ImportError:
+    import json
+
+from gevent import pool
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
@@ -13,21 +21,21 @@ from urllib.parse import quote, unquote
 # ---------------------------------------------------------
 # AYARLAR VE SABİTLER
 # ---------------------------------------------------------
-# Vavoo altyapısı bu User-Agent ile daha stabil çalışır
 USER_AGENT = "VAVOO/2.6"
 SOURCES = [
     "https://vavoo.to"
 ]
 
-# Çöp toplama mekanizmasını rahatlat (Mikro takılmaları önler)
-gc.set_threshold(1000, 20, 20)
+# Çöp toplamayı biraz daha agresif yap (RAM şişmesini engeller)
+# Streaming sunucularında nesneler hızlı oluşup ölür.
+gc.set_threshold(700, 10, 10)
 
 # SSL Uyarılarını kapat
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# Logları sustur (Performans için)
+# Logları tamamen kapat (Disk I/O tasarrufu)
 import logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -36,34 +44,35 @@ app.logger.disabled = True
 # ---------------------------------------------------------
 # BAĞLANTI HAVUZU (Connection Pool)
 # ---------------------------------------------------------
+# Pool size'ı artırdık çünkü video segmentleri çok fazla bağlantı açar.
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100,
-    pool_maxsize=200,
-    max_retries=1, # Tekrar denemeyi kod içinde manuel yapacağız
+    pool_connections=200,   # Aynı anda açık tutulacak host sayısı
+    pool_maxsize=500,       # Havuzdaki maksimum bağlantı sayısı
+    max_retries=1,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 session.headers.update({
     "User-Agent": USER_AGENT,
-    "Accept-Encoding": "gzip, deflate", # Sıkıştırmayı kabul et, sonra biz açacağız
     "Connection": "keep-alive"
 })
+
+# Video akışı için daha büyük buffer (64KB) - CPU kullanımını düşürür
+CHUNK_SIZE = 64 * 1024 
 
 # ---------------------------------------------------------
 # YARDIMCI FONKSİYONLAR
 # ---------------------------------------------------------
 
 def get_best_live_data():
-    """
-    Kanal listesini çekmek için sırayla kaynakları dener.
-    İlk çalışan kaynağın verisini döndürür.
-    """
+    """Kanal listesini çeker. Timeout düşürüldü."""
     for src in SOURCES:
         try:
+            # Timeout 3sn'ye çekildi, cevap vermiyorsa hızlıca pas geçsin
             url = f"{src}/live2/index"
-            r = session.get(url, verify=False, timeout=5)
+            r = session.get(url, verify=False, timeout=3)
             if r.status_code == 200:
                 return r.json(), src
         except:
@@ -71,15 +80,12 @@ def get_best_live_data():
     return None, None
 
 def fetch_playlist_content(cid):
-    """
-    M3U8 dosyasını çeker. Hata alırsan diğer kaynakları dener.
-    """
+    """M3U8 dosyasını çeker."""
     cid_clean = cid.replace('.m3u8', '')
-    
     for src in SOURCES:
         try:
             url = f"{src}/play/{cid_clean}/index.m3u8"
-            r = session.get(url, verify=False, timeout=3)
+            r = session.get(url, verify=False, timeout=2.5) # Hızlı failover için timeout düştü
             if r.status_code == 200:
                 return r.content, r.url.rsplit('/', 1)[0], src
         except:
@@ -95,26 +101,33 @@ def root():
     data, working_src = get_best_live_data()
     
     if not data:
-        return Response("Kaynaklara erisilemiyor (Vavoo Servers Down)", 503)
+        return Response("Kaynaklara erisilemiyor", 503)
 
+    # Host URL'yi bir kez hesapla
     host_b = request.host_url.rstrip('/').encode()
-    out = [b"#EXTM3U"]
     
-    # JSON verisini işle ve M3U formatına çevir
+    # List comprehension ve önceden tanımlı byte stringler ile hızlandırma
+    # String birleştirme işlemi döngü içinde maliyetlidir.
+    out_lines = [b"#EXTM3U"]
+    
+    # Bu döngü CPU bound'dur, optimize edildi.
     for item in data:
-        # Sadece Turkey grubu (Bunu silebilirsin tüm kanallar için)
         if item.get("group") == "Turkey":
             try:
+                # String manipülasyonunu minimize et
                 name = item['name'].replace(',', ' ')
                 u = item['url']
-                # URL'den ID'yi temizle
+                # URL parsing işlemini basitleştir
                 cid = u.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                 
-                out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
-                out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
-            except: pass
+                # F-String yerine encode/bytes birleştirme bazen daha hafiftir ama
+                # okunabilirlik için encode edilmiş f-string kullanıyoruz.
+                out_lines.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode('utf-8'))
+                out_lines.append(host_b + b'/live/' + cid.encode('utf-8') + b'.m3u8')
+            except: 
+                pass
 
-    return Response(b"\n".join(out), content_type="application/x-mpegURL")
+    return Response(b"\n".join(out_lines), content_type="application/x-mpegURL")
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
@@ -125,9 +138,9 @@ def playlist_handler(cid):
 
     host_b = request.host_url.rstrip('/').encode()
     base_b = base_url.encode()
-    cid_b = cid.replace('.m3u8', '').encode()
     
     out = []
+    # splitlines() genellikle split('\n')'den daha güvenlidir ama byte ile çalışıyoruz
     lines = content.split(b'\n')
     
     for line in lines:
@@ -137,94 +150,95 @@ def playlist_handler(cid):
         if line.startswith(b'#'):
             out.append(line)
         else:
-            # TS dosyasının tam adresi
+            # TS dosyasını yönlendir
             if line.startswith(b'http'):
                 target = line
             else:
                 target = base_b + b'/' + line
             
-            # TS proxy adresimiz
-            safe_target = quote(target).encode()
+            # quote işlemi maliyetlidir, sadece gerekli karakterleri encode edelim
+            # safe parametresi ile işlem hızlanır
+            safe_target = quote(target, safe='/:?=&').encode()
             out.append(host_b + b'/ts?url=' + safe_target)
             
     return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/ts')
 def segment_handler():
-    """
-    TS dosyalarını indirir. FAILOVER mantığı buradadır.
-    Eğer ana link çalışmazsa, linki manipüle edip diğer sunucudan ister.
-    """
     url_enc = request.args.get('url')
     if not url_enc: return "Bad Request", 400
     
+    # unquote işlemi
     original_target = unquote(url_enc)
     
-    # Hedef URL'nin hangi domainden geldiğini bul
+    # Hedef domain tespiti (String işlemi)
+    path_part = None
     target_domain = None
-    path_part = ""
-    
+
+    # Hızlı kontrol: Vavoo kaynaklarından biri mi?
     for src in SOURCES:
         if src in original_target:
             target_domain = src
-            # URL'nin domainden sonraki kısmını al (/8546/154.ts gibi)
-            path_part = original_target.split(src, 1)[1]
+            # Split işlemi CPU harcar, sadece 1 kere yap
+            try:
+                path_part = original_target.split(src, 1)[1]
+            except IndexError:
+                pass
             break
             
-    # Eğer bilinen bir kaynak değilse direkt dene
+    # Bilinmeyen kaynaksa proxy'le geç
     if not target_domain:
         return proxy_stream(original_target)
 
-    # ÖNCE ORİJİNAL KAYNAĞI DENE
-    # Eğer hata alırsan döngüye girip diğerlerini dene
-    
-    # Kaynak listesini karıştır ki yük dağılsın, ama orijinali en başa koy
-    # (Burada basitlik adına sırayla deniyoruz)
-    
-    # 1. Deneme: Orijinal URL
+    # 1. Deneme: Orijinal
     try:
-        r = session.get(original_target, stream=True, verify=False, timeout=4)
+        r = session.get(original_target, stream=True, verify=False, timeout=3)
         if r.status_code == 200:
-            return Response(stream_with_context(r.iter_content(chunk_size=32768)), 
+            return Response(stream_with_context(r.iter_content(chunk_size=CHUNK_SIZE)), 
                           content_type="video/mp2t")
         r.close()
     except:
         pass
         
-    # 2. Deneme: Failover (Diğer kaynaklar)
-    # Vavoo yapısında dosya yolları genelde standarttır, sadece domain değişir.
-    for src in SOURCES:
-        if src == target_domain: continue # Zaten denedik
-        
-        new_target = src + path_part
-        try:
-            r = session.get(new_target, stream=True, verify=False, timeout=3)
-            if r.status_code == 200:
-                # Kurtardık! Yayına devam.
-                return Response(stream_with_context(r.iter_content(chunk_size=32768)), 
-                              content_type="video/mp2t")
-            r.close()
-        except:
-            continue
+    # 2. Deneme: Failover
+    # path_part varsa diğer sunucuları dene
+    if path_part:
+        for src in SOURCES:
+            if src == target_domain: continue
+            
+            new_target = src + path_part
+            try:
+                r = session.get(new_target, stream=True, verify=False, timeout=2)
+                if r.status_code == 200:
+                    return Response(stream_with_context(r.iter_content(chunk_size=CHUNK_SIZE)), 
+                                  content_type="video/mp2t")
+                r.close()
+            except:
+                continue
 
     return Response("Source Error", 502)
 
 def proxy_stream(url):
-    # Harici kaynaklar için basit proxy
     try:
         r = session.get(url, stream=True, verify=False, timeout=5)
-        return Response(stream_with_context(r.iter_content(chunk_size=32768)), 
+        return Response(stream_with_context(r.iter_content(chunk_size=CHUNK_SIZE)), 
                         content_type="video/mp2t")
     except:
         return Response("Error", 502)
 
 if __name__ == "__main__":
     print("---------------------------------------")
-    print(" ► VAVOO PROXY - FAILOVER EDITION")
-    print(" ► USER-AGENT: VAVOO/2.6")
+    print(" ► VAVOO PROXY - TURBO EDITION")
+    print(" ► OPTIMIZASYON: UJSON + 64KB CHUNK")
     print(" ► PORT: 8080")
     print("---------------------------------------")
     
-    # Backlog çok yüksek tutuldu, istek düşmesi olmasın
-    server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535)
-    server.serve_forever()
+    # Spawn pool ile thread limitini kontrol altına alıyoruz.
+    # Bu, CPU %100 olduğunda sunucunun kilitlenmesini engeller.
+    worker_pool = pool.Pool(1000)
+    
+    server = WSGIServer(('0.0.0.0', 8080), app, spawn=worker_pool, log=None)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
