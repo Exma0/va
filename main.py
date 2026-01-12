@@ -1,21 +1,14 @@
 from gevent import monkey
 monkey.patch_all()
 
-import time
 import requests
 import urllib3
 import gc
-import sys
 from gevent import pool
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
 
-# ---------------------------------------------------------------------------
-# AYARLAR
-# ---------------------------------------------------------------------------
-
-# Hızlı JSON ayrıştırıcı
 try:
     import ujson as json
 except ImportError:
@@ -28,23 +21,16 @@ SOURCES = [
 USER_AGENT = "VAVOO/2.6"
 PORT = 8080
 
-# DİKKAT: Buffer (CHUNK_SIZE) kaldırıldı.
-# Veri geldiği gibi anında iletilecek.
-
 gc.set_threshold(700, 10, 10)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# Logları kapat
 import logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app.logger.disabled = True
 
-# ---------------------------------------------------------------------------
-# BAĞLANTI HAVUZU
-# ---------------------------------------------------------------------------
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=200,
@@ -59,12 +45,7 @@ session.headers.update({
     "Connection": "keep-alive"
 })
 
-# ---------------------------------------------------------------------------
-# YARDIMCI FONKSİYONLAR
-# ---------------------------------------------------------------------------
-
 def get_best_live_data():
-    """Kanal listesini çeker (Liste için timeout şarttır, 4sn)"""
     for src in SOURCES:
         try:
             r = session.get(f"{src}/live2/index", verify=False, timeout=4)
@@ -75,7 +56,6 @@ def get_best_live_data():
     return None, None
 
 def fetch_playlist_content(cid):
-    """M3U8 dosyasını çeker"""
     cid_clean = cid.replace('.m3u8', '')
     for src in SOURCES:
         try:
@@ -88,22 +68,15 @@ def fetch_playlist_content(cid):
     return None, None, None
 
 def proxy_stream(url, timeout_settings):
-    """Harici kaynaklar için proxy (Buffer yok)"""
     try:
         r = session.get(url, stream=True, verify=False, timeout=timeout_settings)
-        # chunk_size=None yaparak gelen veriyi 1 bayt bile olsa beklemeden yollar
         return Response(stream_with_context(r.iter_content(chunk_size=None)), 
                         content_type="video/mp2t")
     except:
         return Response("Error", 502)
 
-# ---------------------------------------------------------------------------
-# ROUTE İŞLEMLERİ
-# ---------------------------------------------------------------------------
-
 @app.route('/')
 def root():
-    """Ana liste"""
     data, working_src = get_best_live_data()
     
     if not data:
@@ -128,7 +101,6 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    """Kanal akış dosyası"""
     content, base_url, used_src = fetch_playlist_content(cid)
     
     if not content:
@@ -155,18 +127,11 @@ def playlist_handler(cid):
 
 @app.route('/ts')
 def segment_handler():
-    """
-    Video parçalarını çeken ve ileten fonksiyon.
-    BUFFER YOK & READ TIMEOUT YOK.
-    """
     url_enc = request.args.get('url')
     if not url_enc: return "Bad Request", 400
     
     original_target = unquote(url_enc)
-    
-    # Connect Timeout: 5 sn (Bağlanana kadar)
-    # Read Timeout: None (Bağlandıktan sonra sonsuz)
-    TIMEOUT_SETTINGS = (5, None)
+    TIMEOUT_SETTINGS = (None, None)
 
     path_part = None
     target_domain = None
@@ -181,18 +146,15 @@ def segment_handler():
     if not target_domain:
         return proxy_stream(original_target, TIMEOUT_SETTINGS)
 
-    # 1. DENEME
     try:
         r = session.get(original_target, stream=True, verify=False, timeout=TIMEOUT_SETTINGS)
         if r.status_code == 200:
-            # chunk_size=None -> Veri geldiği gibi akar (Direct Stream)
             return Response(stream_with_context(r.iter_content(chunk_size=None)), 
                           content_type="video/mp2t")
         r.close()
     except:
         pass 
         
-    # 2. DENEME (Failover)
     if path_part:
         for src in SOURCES:
             if src == target_domain: continue
@@ -210,12 +172,6 @@ def segment_handler():
     return Response("Source Error", 502)
 
 if __name__ == "__main__":
-    print("---------------------------------------")
-    print(f" ► VAVOO PROXY - ZERO BUFFER MODE")
-    print(f" ► MOD: DIRECT STREAM (Gecikmesiz)")
-    print(f" ► PORT: {PORT}")
-    print("---------------------------------------")
-    
     worker_pool = pool.Pool(1000)
     server = WSGIServer(('0.0.0.0', PORT), app, spawn=worker_pool, log=None)
     try:
