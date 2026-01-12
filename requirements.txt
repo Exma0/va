@@ -1,4 +1,5 @@
 flask
 requests
 gevent
+gunicorn
 urllib3
