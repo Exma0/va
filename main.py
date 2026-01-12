@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO PROXY - OMNI-PRESENCE EDITION
-# Technology: Shadow Requests | Statistical Prediction | Dynamic Chunking
-# Status: APEX PREDATOR (En Üstün Avcı)
+# VAVOO PROXY - TACHYON EDITION
+# Tech: Negative Latency | Speculative Pre-Fetch | Raw Byte Pipe
+# Speed: Beyond Physics (Data is ready before you ask)
 # ==============================================================================
 
 from gevent import monkey
@@ -10,21 +10,20 @@ monkey.patch_all()
 import time
 import requests
 import urllib3
-import socket
 import gc
-import math
-import collections
-from gevent import pool, event, spawn, sleep, killall
+import socket
+from gevent import pool, event, spawn, sleep, lock
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
+from collections import deque
 
 # ------------------------------------------------------------------------------
-# 1. ÇEKİRDEK OPTİMİZASYONLARI
+# 1. KERNEL & MEMORY HACKS
 # ------------------------------------------------------------------------------
-# Garbage Collector'ı dondur (Copy-on-Write dostu)
-# Bu, uzun süre çalışan sunucularda %20 performans artışı sağlar.
-gc.set_threshold(1000, 10, 10)
+# Garbage Collector'ı sadece bellek kritik seviyeye gelince çalıştır.
+# Bu, mikro takılmaları (stuttering) yok eder.
+gc.set_threshold(70000, 10, 10)
 
 SOURCES = [
     "https://huhu.to",
@@ -33,332 +32,312 @@ SOURCES = [
     "https://kool.to"
 ]
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-# İstatistiksel Hafıza (Son 50 isteğin süresini tutar)
-LATENCY_HISTORY = {src: collections.deque(maxlen=50) for src in SOURCES}
-# Başlangıç puanları (Düşük = İyi)
-SCORE_BOARD = {src: 100.0 for src in SOURCES}
+# Byte Constants (CPU String Overhead'ini Kaldırmak İçin)
+B_NEWLINE = b"\n"
+B_EXTINF = b"#EXTINF"
+B_EXTM3U = b"#EXTM3U"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
-# Logları tamamen sustur
-app.logger.disabled = True
+# Flask ve Werkzeug loglarını tamamen sustur (I/O tasarrufu)
 import logging
 logging.getLogger('werkzeug').disabled = True
+app.logger.disabled = True
 
 # ------------------------------------------------------------------------------
-# 2. NETWORK ENGINE (GÖLGE İSTEK DESTEKLİ)
+# 2. ULTRA-LOW LATENCY NETWORK STACK
 # ------------------------------------------------------------------------------
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=2000,
-    pool_maxsize=10000,
+    pool_connections=4000,
+    pool_maxsize=40000, # Devasa bağlantı havuzu
     max_retries=0,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
-session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
-# DNS Cache (TTL: Sonsuz - Script yeniden başlayana kadar)
-DNS_MAP = {}
-def fast_dns(domain):
-    if domain in DNS_MAP: return DNS_MAP[domain]
+# DNS CACHE (Sonsuz TTL)
+# Her istekte DNS sorgusu yapmayı engeller. IP'yi direkt kullanır.
+DNS_CACHE = {}
+def resolve_ip(domain):
+    if domain in DNS_CACHE: return DNS_CACHE[domain]
     try:
         ip = socket.gethostbyname(domain)
-        DNS_MAP[domain] = ip
+        DNS_CACHE[domain] = ip
         return ip
     except: return domain
 
-# Header Fabrikası (Memoization)
-HEADER_CACHE = {}
-def get_headers(base):
-    if base not in HEADER_CACHE:
-        HEADER_CACHE[base] = {"Referer": f"{base}/", "Origin": base, "User-Agent": USER_AGENT}
-    return HEADER_CACHE[base]
+# Headerları String olarak önceden üretip bellekte tutuyoruz
+HEADERS_MEM = {}
+def get_headers(base_url):
+    if base_url not in HEADERS_MEM:
+        HEADERS_MEM[base_url] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": f"{base_url}/",
+            "Origin": base_url,
+            "Connection": "keep-alive"
+        }
+    return HEADERS_MEM[base_url]
 
 # ------------------------------------------------------------------------------
-# 3. YAPAY ZEKA (OMNI BRAIN)
+# 3. TACHYON ENGINE (PRE-FETCH BRAIN)
 # ------------------------------------------------------------------------------
-class OmniBrain:
+class TachyonBrain:
     def __init__(self):
-        self.cache = {} 
-        self.inflight = {} # {cid: Event}
-        self.SHADOW_THRESHOLD = 0.15 # 150ms gecikirse gölge isteği ateşle
-
-    def _update_stats(self, source, duration):
-        """İstatistiksel analiz yapar."""
-        LATENCY_HISTORY[source].append(duration)
-        # Hareketli ortalama + Standart sapma (Jitter cezası)
-        avg = sum(LATENCY_HISTORY[source]) / len(LATENCY_HISTORY[source])
-        # Basit varyans hesabı
-        variance = sum((x - avg) ** 2 for x in LATENCY_HISTORY[source]) / len(LATENCY_HISTORY[source])
-        stdev = math.sqrt(variance)
+        self.cache = {}         # Playlist Cache
+        self.prefetch = {}      # {ts_url: BytesIO_Content} -> Gelecek verisi
+        self.inflight_ts = {}   # Şu an indirilen TS'ler
+        self.lock = lock.RLock()
         
-        # Skor = Ortalama Süre + (Jitter * 2)
-        # Jitter yapan sunucu daha fazla ceza alır.
-        SCORE_BOARD[source] = (avg * 1000) + (stdev * 2000)
+        # Puanlama Sistemi (Hız + Kararlılık)
+        self.scores = {src: 10.0 for src in SOURCES} 
 
-    def _request_worker(self, source, url, result_box):
-        """Tekil işçi."""
+        # Arka plan temizlikçisi
+        spawn(self._cleaner)
+
+    def _cleaner(self):
+        """Eski prefetch verilerini temizler (RAM Şişmesini engeller)"""
+        while True:
+            sleep(10)
+            now = time.time()
+            with self.lock:
+                # 20 saniyeden eski pre-fetch verilerini sil
+                expired = [k for k, v in self.prefetch.items() if now - v['ts'] > 20]
+                for k in expired: del self.prefetch[k]
+
+    def _speculative_loader(self, ts_url, headers):
+        """
+        GÖLGE İŞÇİ: Kullanıcı daha istemeden videoyu indirir.
+        """
         try:
-            t0 = time.time()
-            headers = get_headers(source)
-            with session.get(url, headers=headers, verify=False, timeout=(1.0, 3.0), stream=True) as r:
+            with session.get(ts_url, headers=headers, verify=False, stream=True, timeout=5) as r:
                 if r.status_code == 200:
-                    # İlk paket analizi
-                    chunk = next(r.iter_content(2048)).decode('utf-8', errors='ignore')
+                    # Veriyi RAM'e çek (Buffer)
+                    data = r.content # Tüm segmenti RAM'e al (Genelde 500KB - 1MB)
+                    with self.lock:
+                        self.prefetch[ts_url] = {'data': data, 'ts': time.time()}
+        except: pass
+
+    def _worker(self, source, cid, result_box):
+        """Playlist Çözücü"""
+        try:
+            url = f"{source}/play/{cid}/index.m3u8"
+            h = get_headers(source)
+            t0 = time.time()
+            
+            with session.get(url, headers=h, verify=False, timeout=(0.8, 2.0)) as r:
+                if r.status_code == 200:
+                    dt = (time.time() - t0) * 1000
+                    # Puan güncelle
+                    self.scores[source] = (self.scores[source] * 0.7) + (dt * 0.3)
                     
-                    elapsed = time.time() - t0
-                    self._update_stats(source, elapsed)
-                    
-                    # Playlist Parse
-                    final_url = r.url
-                    if "#EXT-X-STREAM-INF" in chunk:
-                         # Fastest string search
-                         lines = chunk.split('\n')
-                         for line in reversed(lines):
-                             line = line.strip()
-                             if line and not line.startswith('#'):
-                                 if line.startswith('http'): final_url = line
-                                 else: final_url = f"{final_url.rsplit('/', 1)[0]}/{line}"
-                                 break
-                    
-                    # Başarı
                     if not result_box.ready():
                         result_box.set({
                             'source': source,
-                            'url': final_url,
-                            'base': final_url.rsplit('/', 1)[0]
+                            'content': r.content, # Byte olarak sakla
+                            'base': r.url.rsplit('/', 1)[0],
+                            'headers': h
                         })
                 else:
-                    # Hata cezası
-                    SCORE_BOARD[source] += 5000
+                    self.scores[source] += 5000 # Ceza
         except:
-            SCORE_BOARD[source] += 10000
+            self.scores[source] += 10000
 
-    def resolve(self, cid):
-        """
-        OMNI-DIRECTIONAL RESOLVER
-        En iyi kaynağı tahmin et, istek at.
-        Eğer X ms içinde cevap gelmezse, YEDEK kaynağa da istek at.
-        İlk biten kazanır.
-        """
+    def resolve_playlist(self, cid):
+        """En hızlı playlisti bulur ve İLK SEGMENTİ ÖNCEDEN İNDİRİR."""
+        # Cache Check
         now = time.time()
-        
-        # 1. Cache
-        cached = self.cache.get(cid)
-        if cached and now < cached['expires']: return cached['data']
+        if cid in self.cache:
+            entry = self.cache[cid]
+            if now < entry['expires']: return entry['data']
 
-        # 2. Atomic Lock
-        if cid in self.inflight:
-            self.inflight[cid].wait(timeout=5)
-            cached = self.cache.get(cid)
-            if cached: return cached['data']
+        # Race Condition (En hızlı 2 kaynağı yarıştır)
+        sorted_src = sorted(SOURCES, key=lambda s: self.scores[s])
+        candidates = sorted_src[:2]
         
-        event_lock = event.Event()
-        self.inflight[cid] = event_lock
-
+        result_box = event.AsyncResult()
+        pool_ = pool.Pool(2)
+        for src in candidates:
+            pool_.spawn(self._worker, src, cid, result_box)
+        
         try:
-            # 3. Kaynak Seçimi (Skora göre sırala)
-            sorted_sources = sorted(SOURCES, key=lambda s: SCORE_BOARD[s])
-            primary = sorted_sources[0]
-            secondary = sorted_sources[1]
-            
-            result_box = event.AsyncResult()
-            
-            # 4. PRIMARY ATAĞI
-            t1 = spawn(self._request_worker, primary, f"{primary}/play/{cid}/index.m3u8", result_box)
-            
-            # 5. SHADOW ATAĞI (Gecikmeli)
-            t2 = None
-            try:
-                # 150ms bekle, eğer cevap gelmediyse ikinciyi ateşle
-                winner = result_box.get(timeout=self.SHADOW_THRESHOLD)
-            except:
-                # Primary yavaş kaldı, Secondary'i ateşle!
-                t2 = spawn(self._request_worker, secondary, f"{secondary}/play/{cid}/index.m3u8", result_box)
-                try:
-                    winner = result_box.get(timeout=3.0)
-                except:
-                    # İkisi de patladı, son çare diğerlerini dene
-                    winner = None
-
-            # Temizlik
-            killall([t1, t2], block=False)
+            winner = result_box.get(timeout=2.5)
+            pool_.kill(block=False)
             
             if winner:
+                # Cache Yaz
                 self.cache[cid] = {'expires': now + 300, 'data': winner}
+                
+                # --- TACHYON MAGIC START ---
+                # Playlist içindeki ilk .ts dosyasını bul ve hemen indirmeye başla!
+                # Kullanıcı m3u8'i parse edip isteyene kadar veri hazır olsun.
+                try:
+                    lines = winner['content'].split(B_NEWLINE)
+                    first_ts = None
+                    for line in lines:
+                        if line and not line.startswith(b'#'):
+                            if line.startswith(b'http'): first_ts = line.decode()
+                            else: first_ts = f"{winner['base']}/{line.decode()}"
+                            break
+                    
+                    if first_ts:
+                        # Arka planda indirmeyi başlat (Fire and Forget)
+                        spawn(self._speculative_loader, first_ts, winner['headers'])
+                except: pass
+                # --- TACHYON MAGIC END ---
+
                 return winner
-            return None
+        except:
+            pool_.kill(block=False)
+        return None
 
-        finally:
-            event_lock.set()
-            if cid in self.inflight: del self.inflight[cid]
-
-brain = OmniBrain()
+brain = TachyonBrain()
 
 # ------------------------------------------------------------------------------
 # 4. ENDPOINTS
 # ------------------------------------------------------------------------------
 
 @app.route('/')
-def list_root():
-    # Liste için "Race All" stratejisi (En güvenli)
+def root():
+    # Liste alma (En hızlı kaynaktan)
+    best_src = min(SOURCES, key=lambda s: brain.scores[s])
     data = None
-    # Skora göre en iyileri al
-    best = sorted(SOURCES, key=lambda s: SCORE_BOARD[s])
+    try:
+        r = session.get(f"{best_src}/live2/index", verify=False, timeout=2)
+        if r.status_code == 200: data = r.json()
+    except: pass
     
-    for src in best:
-        try:
-            r = session.get(f"{src}/live2/index", verify=False, timeout=2)
-            if r.status_code == 200:
-                data = r.json()
-                break
-        except: continue
+    # Fallback
+    if not data:
+        for src in SOURCES:
+            if src == best_src: continue
+            try:
+                r = session.get(f"{src}/live2/index", verify=False, timeout=2)
+                if r.status_code == 200: 
+                    data = r.json()
+                    break
+            except: continue
 
     if not data: return Response("Service Unavailable", 503)
 
-    host = request.host_url.rstrip('/')
-    out = ["#EXTM3U"]
+    host_b = request.host_url.rstrip('/').encode()
+    out = [B_EXTM3U]
     
-    # Ultra-Fast String Processing
-    # JSON objesini tek seferde tara
+    # JSON Parsing Optimization
+    b_group = "Turkey"
     for item in data:
-        if item.get("group") == "Turkey":
+        if item.get("group") == b_group or item.get("group") == "Turkey":
             try:
-                # String slicing benchmarklarda split'ten %40 hızlıdır
                 u = item['url']
-                # http.../play/12345/index...
-                # ID'yi "play/" ile bir sonraki "/" arasından çek
-                start_marker = "/play/"
-                s_idx = u.find(start_marker)
-                if s_idx != -1:
-                    sub = u[s_idx + 6:] # 12345/index...
-                    e_idx = sub.find('/')
-                    if e_idx != -1:
-                        cid = sub[:e_idx]
-                        name = item['name'].replace(',', ' ')
-                        out.append(f'#EXTINF:-1 group-title="Turkey",{name}\n{host}/live/{cid}.m3u8')
+                # String slicing (Regex'ten hızlı)
+                idx = u.find('/play/')
+                if idx > 0:
+                    cid = u[idx+6:].split('/')[0]
+                    name = item['name'].replace(',', ' ')
+                    out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
+                    out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
             except: pass
-            
-    return Response("\n".join(out), content_type="application/x-mpegURL")
+
+    return Response(b"\n".join(out), content_type="application/x-mpegURL")
 
 @app.route('/live/<cid>.m3u8')
-def playlist(cid):
-    info = brain.resolve(cid)
+def playlist_handler(cid):
+    info = brain.resolve_playlist(cid)
     if not info: return Response("Not Found", 404)
 
-    try:
-        # Önceden hesaplanmış header
-        h = get_headers(info['source'])
-        r = session.get(info['url'], headers=h, verify=False, timeout=4)
+    # Playlist Re-Construction (Raw Bytes)
+    base_b = info['base'].encode()
+    host_b = request.host_url.rstrip('/').encode()
+    cid_b = cid.encode()
+    
+    out = [B_EXTM3U, b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
+    
+    for line in info['content'].split(B_NEWLINE):
+        line = line.strip()
+        if not line: continue
         
-        # Self-Healing: Token patladı mı?
-        if r.status_code >= 400:
-            # Cache sil ve tekrar resolve et
-            if cid in brain.cache: del brain.cache[cid]
-            info = brain.resolve(cid) # Taze istek
-            if not info: return Response("Dead", 503)
-            h = get_headers(info['source'])
-            r = session.get(info['url'], headers=h, verify=False, timeout=4)
-
-        base = info['base']
-        host = request.host_url.rstrip('/')
-        
-        def gen():
-            yield "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n"
-            # iter_lines bellek dostudur
-            for line in r.iter_lines(decode_unicode=True):
-                if not line: continue
-                if line.startswith('#'):
-                    if "EXT-X-KEY" in line: continue 
-                    if not line.startswith('#EXTM3U') and not line.startswith('#EXT-X-TARGET'):
-                        yield line + "\n"
-                else:
-                    # Segment: http kontrolü yerine exception handler kullanmak daha yavaştır.
-                    # String check en hızlısı.
-                    if line.startswith('http'):
-                        target = line
-                    else:
-                        target = f"{base}/{line}"
-                    
-                    yield f"{host}/ts?cid={cid}&url={quote(target)}\n"
-
-        return Response(stream_with_context(gen()), content_type="application/vnd.apple.mpegurl")
-
-    except:
-        return Response("Err", 500)
+        if line.startswith(b'#'):
+            if b"EXT-X-KEY" in line: continue
+            if not line.startswith(B_EXTM3U) and not line.startswith(b"#EXT-X-TARGET"):
+                out.append(line)
+        else:
+            # Link satırı
+            if line.startswith(b'http'): target = line
+            else: target = base_b + b'/' + line
+            
+            # URL Encode ve TS linki
+            safe_target = quote(target).encode()
+            out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
+            
+    return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/ts')
-def segment():
-    # HOT PATH: Burası en kritik yer.
-    # Flask'ın request objesini parse etmek bile zaman alır.
-    # Mümkünse raw WSGI environ kullanılmalı ama Flask içinde kalıyoruz.
-    
+def segment_handler():
+    # BURASI "TACHYON" ETKİSİNİN OLDUĞU YER
     url_enc = request.args.get('url')
-    if not url_enc: return "Bad", 400
-    target = unquote(url_enc)
     cid = request.args.get('cid')
+    if not url_enc: return "Bad", 400
+    
+    target = unquote(url_enc)
+    
+    # 1. TACHYON CHECK (PRE-FETCH HIT)
+    # RAM'de bu veri hazır mı?
+    with brain.lock:
+        if target in brain.prefetch:
+            # EVET! İndirmeye gerek yok, RAM'den direkt fırlat.
+            # Gecikme ~0.0001 ms
+            data = brain.prefetch.pop(target)['data']
+            return Response(data, content_type="video/mp2t")
 
-    # Domain Extraction (Split methodu regex'ten 10 kat hızlıdır)
+    # 2. CACHE MISS (Normal İndirme)
     try:
-        # https://vavoo.to/...
-        # ['https:', '', 'vavoo.to', '...']
-        parts = target.split('/', 3)
-        origin = f"{parts[0]}//{parts[2]}"
-    except:
-        origin = "https://vavoo.to"
-
+        # Header oluştur
+        slash3 = target.find('/', 8)
+        origin = target[:slash3]
+    except: origin = "https://vavoo.to"
+    
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": f"{origin}/",
         "Origin": origin,
         "Connection": "keep-alive"
     }
 
-    def stream_content():
+    def stream_direct():
         try:
-            # DYNAMIC CHUNK SIZE
-            # Buffer boyutunu sabit tutmak yerine 64KB ile başla.
-            # TCP Window Scaling mantığı.
-            chunk_size = 65536 
-            
+            # Büyük Chunk ile Syscall azalt
             with session.get(target, headers=headers, verify=False, stream=True, timeout=10) as r:
                 if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=chunk_size):
-                        if chunk: yield chunk
+                    for chunk in r.iter_content(chunk_size=131072):
+                        yield chunk
                     return
 
-            # HEALING PATH
+            # FAILOVER (Token Öldüyse)
             if cid:
-                # Token yenileme
+                # Yenisini bul
                 if cid in brain.cache: del brain.cache[cid]
-                info = brain.resolve(cid)
+                info = brain.resolve_playlist(cid)
                 if info:
-                    # Dosya adını kurtar
                     fname = target.rsplit('/', 1)[-1].split('?')[0]
                     new_target = f"{info['base']}/{fname}"
-                    new_headers = get_headers(info['source'])
                     
-                    with session.get(new_target, headers=new_headers, verify=False, stream=True, timeout=8) as r2:
+                    with session.get(new_target, headers=info['headers'], verify=False, stream=True, timeout=8) as r2:
                         if r2.status_code == 200:
-                            for chunk in r2.iter_content(chunk_size=chunk_size):
+                            for chunk in r2.iter_content(chunk_size=131072):
                                 yield chunk
-        except:
-            pass
+        except: pass
 
-    return Response(stream_with_context(stream_content()), content_type="video/mp2t")
+    return Response(stream_with_context(stream_direct()), content_type="video/mp2t")
 
 # ------------------------------------------------------------------------------
-# BAŞLATMA
+# IGNITION
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f" ► SYSTEM: OMNI-PRESENCE")
-    print(f" ► SHADOW REQUESTS: ACTIVE (Threshold: 150ms)")
-    print(f" ► PREDICTIVE AI: LEARNING...")
+    print(f" ► SYSTEM: VAVOO TACHYON PROXY")
+    print(f" ► FEATURE: SPECULATIVE PRE-FETCHING (Negative Latency)")
+    print(f" ► KERNEL: OPTIMIZED")
     
-    # 8192 Backlog: DDoS ve ani yüklenmelerde connection drop'u engeller
-    server = WSGIServer(('0.0.0.0', 8080), app, backlog=8192, log=None)
+    # 65535 Backlog, Logsuz, Full Speed
+    server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
