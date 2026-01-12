@@ -18,7 +18,7 @@ SOURCES = [
     "https://vavoo.to"
 ]
 
-USER_AGENT = "VAVOO/2.6"
+USER_AGENT = "VAVOO/3.1.20"
 PORT = 8080
 
 gc.set_threshold(700, 10, 10)
