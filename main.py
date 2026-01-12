@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO SINGULARITY - ETERNAL EDITION (V2 - BUGFIX)
-# Fix: 'killall' NameError | Enhanced ID Parsing
-# Status: STABLE & CRASH-PROOF
+# VAVOO SINGULARITY - VOID WALKER EDITION
+# Fix: 0-Byte 200 OK Loop | Tech: Content Validation | Instant Source Banning
+# Status: UNSTOPPABLE
 # ==============================================================================
 
 from gevent import monkey
@@ -19,7 +19,7 @@ from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
 
 # ------------------------------------------------------------------------------
-# 1. MAKİNE AYARLARI
+# 1. SYSTEM TUNING
 # ------------------------------------------------------------------------------
 sys.setswitchinterval(0.001)
 gc.set_threshold(100000, 50, 50)
@@ -31,11 +31,12 @@ SOURCES = [
     "https://kool.to"
 ]
 
+# CRITICAL: Any segment smaller than 1KB is considered "Corrupted/Empty"
 MIN_VALID_SIZE = 1024 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
-# Logları kapat
+# Silence all logs
 import logging
 logging.getLogger('werkzeug').disabled = True
 app.logger.disabled = True
@@ -47,7 +48,7 @@ session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=5000,
     pool_maxsize=50000,
-    max_retries=0,
+    max_retries=0, 
     pool_block=False
 )
 session.mount('http://', adapter)
@@ -65,162 +66,136 @@ def get_headers(base_url):
     return HEADERS_MEM[base_url]
 
 # ------------------------------------------------------------------------------
-# 3. SINGULARITY CORE
+# 3. SINGULARITY CORE (WITH VOID FILTER)
 # ------------------------------------------------------------------------------
 class SingularityCore:
     def __init__(self):
         self.health = {src: 100.0 for src in SOURCES}
-        self.future_cache = {} 
         self.playlist_store = {} 
         self.lock = lock.RLock()
+        # Separate lock for health updates to avoid congestion
+        self.health_lock = lock.RLock()
         spawn(self._optimizer)
 
     def _optimizer(self):
         while True:
             sleep(5)
-            now = time.time()
-            with self.lock:
-                expired = [k for k, v in self.future_cache.items() if now - v['ts'] > 20]
-                for k in expired: del self.future_cache[k]
+            with self.health_lock:
+                # Slowly forgive bad sources
                 for src in self.health:
-                    if self.health[src] < 100: self.health[src] += 5
+                    if self.health[src] < 100: self.health[src] += 10
 
-    def punish(self, source, amount=20):
-        with self.lock:
+    def punish(self, source, amount=50):
+        """Heavy punishment for 0-byte offenders"""
+        with self.health_lock:
             self.health[source] -= amount
 
     def get_top_sources(self):
-        return sorted(SOURCES, key=lambda s: self.health[s], reverse=True)[:2]
+        """Get best sources, sorted by health."""
+        with self.health_lock:
+            return sorted(SOURCES, key=lambda s: self.health[s], reverse=True)
 
-    def _fetch_blob(self, url, source):
+    def _fetch_blob_validated(self, url, source):
+        """Fetches data AND validates size."""
         try:
             h = get_headers(source)
-            with session.get(url, headers=h, verify=False, timeout=(1.5, 4.0)) as r:
+            with session.get(url, headers=h, verify=False, timeout=(2, 4)) as r:
                 if r.status_code == 200:
-                    return r.content
+                    data = r.content
+                    # THE VOID FILTER: Reject empty/small responses
+                    if len(data) > MIN_VALID_SIZE:
+                        return data
+                    else:
+                        self.punish(source, 100) # Instant Ban for 0-byte
                 else:
-                    self.punish(source)
+                    self.punish(source, 20)
         except:
-            self.punish(source)
+            self.punish(source, 20)
         return None
-
-    def predict_next(self, current_m3u8_content, base_url):
-        try:
-            lines = current_m3u8_content.split(b'\n')
-            last_segment = None
-            for line in reversed(lines):
-                line = line.strip()
-                if line and not line.startswith(b'#'):
-                    last_segment = line.decode()
-                    break
-            
-            if last_segment:
-                match = re.search(r'(\d+)', last_segment)
-                if match:
-                    num_val = int(match.group(1))
-                    next_val = num_val + 1
-                    new_seg = last_segment.replace(str(num_val), str(next_val))
-                    if new_seg.startswith('http'): next_url = new_seg
-                    else: next_url = f"{base_url}/{new_seg}"
-                    
-                    top_src = self.get_top_sources()[0]
-                    spawn(self._future_worker, next_url, top_src)
-        except: pass
-
-    def _future_worker(self, url, source):
-        data = self._fetch_blob(url, source)
-        if data and len(data) > MIN_VALID_SIZE:
-            with self.lock:
-                self.future_cache[url] = {'data': data, 'ts': time.time()}
 
     def resolve_playlist(self, cid):
         now = time.time()
-        # ID'yi temizle
-        cid = cid.split('.')[0]
+        cid = cid.split('.')[0] # Clean ID
 
         if cid in self.playlist_store:
             entry = self.playlist_store[cid]
             if now < entry['expires']: return entry['data']
 
+        # Try sources in order of health
         candidates = self.get_top_sources()
-        result_box = event.AsyncResult()
         
-        def worker(src):
+        for src in candidates:
             url = f"{src}/play/{cid}/index.m3u8"
-            data = self._fetch_blob(url, src)
-            if data and not result_box.ready():
-                result_box.set({
+            data = self._fetch_blob_validated(url, src)
+            if data:
+                # Success
+                result = {
                     'content': data,
                     'base': f"{src}/play/{cid}",
                     'source': src
-                })
-
-        p = pool.Pool(2)
-        for src in candidates: p.spawn(worker, src)
+                }
+                self.playlist_store[cid] = {'expires': now + 300, 'data': result}
+                return result
         
-        try:
-            winner = result_box.get(timeout=2.5)
-            p.kill(block=False)
-            if winner:
-                self.predict_next(winner['content'], winner['base'])
-                self.playlist_store[cid] = {'expires': now + 300, 'data': winner}
-                return winner
-        except:
-            p.kill(block=False)
         return None
 
 singularity = SingularityCore()
 
 # ------------------------------------------------------------------------------
-# 4. RAID-1 STREAMING ENGINE (FIXED)
+# 4. FAILOVER STREAMING ENGINE
 # ------------------------------------------------------------------------------
-def raid_streamer(target_url, cid):
-    with singularity.lock:
-        if target_url in singularity.future_cache:
-            yield singularity.future_cache.pop(target_url)['data']
-            return
-
-    filename = target_url.split('/')[-1].split('?')[0]
+def failover_streamer(target_path_suffix, cid):
+    """
+    Attempts to download the segment from sources in priority order.
+    If Source A returns 0 bytes, it IMMEDIATELY tries Source B.
+    """
+    # 1. Get ordered list of healthy sources
     sources = singularity.get_top_sources()
-    packet_queue = queue.Queue()
-    finished = event.Event()
     
-    def source_worker(src):
+    # We strip the query string if present to get clean filename
+    filename = target_path_suffix.split('?')[0]
+    
+    # Track if we found ANY valid data
+    success = False
+
+    for src in sources:
+        # Construct URL for this specific source
+        # Structure: https://huhu.to/play/{cid}/{seg-X.ts}
+        real_url = f"{src}/play/{cid}/{filename}"
+        
         try:
-            real_url = f"{src}/play/{cid}/{filename}"
             h = get_headers(src)
-            with session.get(real_url, headers=h, verify=False, stream=True, timeout=(1.5, 5)) as r:
+            # Stream=True for memory efficiency
+            with session.get(real_url, headers=h, verify=False, stream=True, timeout=(2, 5)) as r:
                 if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        if finished.is_set(): return
-                        if chunk: packet_queue.put(chunk)
+                    # PEEK at the first chunk to validate size/existence
+                    first_chunk = next(r.iter_content(chunk_size=4096), None)
+                    
+                    if first_chunk and len(first_chunk) > 0:
+                        # VALID DATA FOUND!
+                        success = True
+                        yield first_chunk # Yield the first byte immediately
+                        
+                        # Stream the rest
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk: yield chunk
+                        
+                        # If we successfully streamed, stop trying other sources
+                        return 
+                    else:
+                        # 0-Byte or Empty Response -> PUNISH & NEXT
+                        singularity.punish(src, 100)
+                        # Loop continues to next source...
                 else:
-                    singularity.punish(src)
-        except:
-            singularity.punish(src)
+                    singularity.punish(src, 20)
+        except Exception:
+            singularity.punish(src, 20)
+            # Loop continues to next source...
 
-    workers = []
-    for s in sources:
-        workers.append(spawn(source_worker, s))
-
-    chunks_received = 0
-    try:
-        while True:
-            try:
-                chunk = packet_queue.get(timeout=6)
-                yield chunk
-                chunks_received += 1
-            except queue.Empty:
-                break
-    except GeneratorExit:
-        finished.set()
-        killall(workers, block=False) # HATA BURADAYDI, ARTIK DÜZELTİLDİ
-        return
-    except Exception:
+    if not success:
+        # If we reach here, ALL sources failed.
+        # Yield nothing, let connection close.
         pass
-    
-    finished.set()
-    killall(workers, block=False) # HATA BURADAYDI, ARTIK DÜZELTİLDİ
 
 # ------------------------------------------------------------------------------
 # 5. ENDPOINTS
@@ -228,20 +203,17 @@ def raid_streamer(target_url, cid):
 
 @app.route('/')
 def root():
-    best_src = singularity.get_top_sources()[0]
+    # Fetch list from best source
+    sources = singularity.get_top_sources()
     data = None
-    try:
-        r = session.get(f"{best_src}/live2/index", verify=False, timeout=3)
-        if r.status_code == 200: data = r.json()
-    except: pass
     
-    if not data:
-        for src in SOURCES:
-            if src == best_src: continue
-            try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=2)
-                if r.status_code == 200: data = r.json(); break
-            except: continue
+    for src in sources:
+        try:
+            r = session.get(f"{src}/live2/index", verify=False, timeout=3)
+            if r.status_code == 200: 
+                data = r.json()
+                break
+        except: continue
 
     if not data: return Response("Service Unavailable", 503)
 
@@ -252,16 +224,13 @@ def root():
         if item.get("group") == "Turkey":
             try:
                 u = item['url']
-                # Geliştirilmiş ID Parsing (Hatasız)
-                # /play/'den sonrasını al
+                # Parsing Logic
                 if '/play/' in u:
                     rest = u.split('/play/')[-1]
-                    # Eğer 12345/index.m3u8 formatındaysa
                     if '/' in rest: cid = rest.split('/')[0]
-                    # Eğer 12345.m3u8 formatındaysa
                     else: cid = rest.split('.')[0]
                     
-                    if cid.isdigit(): # Sadece rakam olanları al
+                    if cid.isdigit(): 
                         name = item['name'].replace(',', ' ')
                         out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
                         out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
@@ -271,13 +240,14 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    # Çift uzantı kontrolü (123.m3u8.m3u8 -> 123)
     clean_cid = cid.split('.')[0]
-    
     info = singularity.resolve_playlist(clean_cid)
+    
     if not info: return Response("Not Found", 404)
 
-    base_b = info['base'].encode()
+    # Reconstruct Playlist
+    # We ignore the 'base' from info because we want to force our /ts endpoint
+    # to handle failover dynamically for every segment.
     host_b = request.host_url.rstrip('/').encode()
     cid_b = clean_cid.encode()
     
@@ -292,29 +262,38 @@ def playlist_handler(cid):
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
         else:
-            if line.startswith(b'http'): target = line
-            else: target = base_b + b'/' + line
+            # This is the segment filename (e.g., seg-123.ts)
+            # We extract just the filename
+            line_str = line.decode()
+            if line_str.startswith('http'):
+                filename = line_str.split('/')[-1]
+            else:
+                filename = line_str
             
-            safe_target = quote(target).encode()
+            # We encode the filename as 'url' parameter, but treat it as a relative path suffix
+            safe_target = quote(filename).encode()
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
     return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/ts')
 def segment_handler():
-    url_enc = request.args.get('url')
+    # Logic Change: 'url' parameter is now treated as the FILENAME (suffix)
+    # The brain decides which source base URL to prepend.
+    url_param = request.args.get('url')
     cid = request.args.get('cid')
-    if not url_enc: return "Bad", 400
     
-    target = unquote(url_enc)
+    if not url_param or not cid: return "Bad", 400
     
-    stream_gen = raid_streamer(target, cid)
+    filename = unquote(url_param)
     
-    return Response(stream_with_context(stream_gen), content_type="video/mp2t")
+    # Use the Failover Streamer
+    # This function loops through sources until it finds NON-ZERO bytes.
+    return Response(stream_with_context(failover_streamer(filename, cid)), content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► VAVOO SINGULARITY - ETERNAL (V2)")
-    print(f" ► FIXED: killall NameError")
-    print(f" ► FIXED: ID Parsing Logic")
+    print(f" ► VAVOO VOID WALKER (FINAL FIX)")
+    print(f" ► LOGIC: 0-BYTE REJECTION & INSTANT FAILOVER")
+    print(f" ► LISTENING: 8080")
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
