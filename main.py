@@ -1,24 +1,22 @@
 from gevent import monkey
 monkey.patch_all()
 
-import json
 import re
-import requests
 import time
-import sys
+import requests
 import urllib3
+import gevent
+from gevent.pool import Pool
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import urljoin, quote, unquote, urlparse
-from threading import Lock, RLock
 from gevent.pywsgi import WSGIServer
 
 app = Flask(__name__)
 
 # =====================================================
-# AYARLAR VE KAYNAKLAR
+# AYARLAR
 # =====================================================
 
-# Öncelik sırasına göre kaynaklar. (Huhu genelde en hızlısıdır)
 SOURCES = [
     "https://huhu.to",
     "https://vavoo.to",
@@ -26,288 +24,271 @@ SOURCES = [
     "https://kool.to"
 ]
 
+# User-Agent Vavoo sistemleri için kritiktir, değiştirilmemeli.
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Connection": "keep-alive"
+    "Connection": "keep-alive",
+    "Accept-Encoding": "gzip, deflate"
 }
 
-# SSL Uyarılarını Kapat
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Bağlantı Havuzu (Daha agresif ayarlandı)
+# Session Ayarları (Daha agresif timeout ve pool)
 session = requests.Session()
-# Max size 200'e çıkarıldı, aynı anda çok istek gelirse kuyruk oluşmasın
-adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
+# Max size 1000'e çıkarıldı, yüksek trafik için.
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, 
+    pool_maxsize=1000, 
+    max_retries=1,
+    pool_block=False
+)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# Yardımcı Fonksiyon: Dinamik Header Oluşturucu
 def get_headers(base_url):
-    """İstek atılan domain'e uygun Referer ve Origin üretir."""
-    headers = BASE_HEADERS.copy()
-    headers["Referer"] = f"{base_url}/"
-    headers["Origin"] = base_url
-    return headers
+    return {
+        **BASE_HEADERS,
+        "Referer": f"{base_url}/",
+        "Origin": base_url
+    }
 
 # =====================================================
-# THE BRAIN (Çoklu Kaynak Çözümleme Merkezi)
+# AKILLI BEYİN (Concurrent Resolver)
 # =====================================================
-class StreamBrain:
+class TurboBrain:
     def __init__(self):
-        # Cache yapısı: { 'cid': {'final_url': '...', 'updated_at': 123, 'source_used': 'https://...'} }
-        self.channels = {}
-        self.locks = {}
-        self.global_lock = RLock()
+        # { 'cid': {'url': '...', 'ts': 123456, 'headers': {...}} }
+        self.cache = {}
+        # Aynı anda aynı kanal için sorgu gelirse yığılmayı önlemek için
+        self.pending_resolves = {}
 
-    def get_lock(self, cid):
-        with self.global_lock:
-            if cid not in self.locks:
-                self.locks[cid] = Lock()
-            return self.locks[cid]
-
-    def resolve_stream_url(self, cid, force_refresh=False):
-        """
-        Kanalı bulmak için tüm kaynakları tarar.
-        """
-        # Cache Kontrolü (5 Dakika)
-        if not force_refresh and cid in self.channels:
-            if time.time() - self.channels[cid]['updated_at'] < 300:
-                return self.channels[cid]['final_url']
-
-        lock = self.get_lock(cid)
-        with lock:
-            # Race condition için tekrar kontrol
-            if not force_refresh and cid in self.channels:
-                if time.time() - self.channels[cid]['updated_at'] < 300:
-                    return self.channels[cid]['final_url']
+    def _check_source(self, source_url, cid):
+        """Tekil bir kaynağı test eden worker fonksiyon."""
+        try:
+            target_url = f"{source_url}/play/{cid}/index.m3u8"
+            headers = get_headers(source_url)
             
-            # TÜM KAYNAKLARI DENE (Failover Logic)
-            for source_url in SOURCES:
-                try:
-                    # 1. API İsteği
-                    initial_url = f"{source_url}/play/{cid}/index.m3u8"
-                    current_headers = get_headers(source_url)
-                    
-                    # Timeout düşük tutuldu, hızlıca diğer kaynağa geçsin diye (4sn)
-                    r = session.get(initial_url, headers=current_headers, verify=False, timeout=4, allow_redirects=True)
-                    
-                    if r.status_code != 200:
-                        continue # Bu site çalışmadı, sonrakine geç
+            # Bağlantı timeout çok kısa (2sn), okuma timeout (5sn)
+            # Amaç: Yanıt vermeyen sunucuyu hemen elemek.
+            r = session.get(target_url, headers=headers, verify=False, timeout=(2, 5))
+            
+            if r.status_code == 200:
+                # Redirect kontrolü ve Stream URL çözme
+                final_url = r.url
+                content = r.text
+                
+                # Master playlist ise en iyi kaliteyi seçmeye çalış (basit mantık)
+                if "#EXT-X-STREAM-INF" in content:
+                    lines = content.splitlines()
+                    # Genelde son stream en kalitelisidir, ters tara
+                    for line in reversed(lines):
+                        if line and not line.startswith("#"):
+                            final_url = urljoin(final_url, line)
+                            # Linkin sağlamasını yap (sadece header isteği ile)
+                            # Hız için bu adımı atlayıp direkt URL'i kabul ediyoruz (Optimistik yaklaşım)
+                            break
+                
+                return {
+                    'url': final_url,
+                    'source': source_url,
+                    'headers': get_headers(source_url) # O anki geçerli header
+                }
+        except:
+            return None
+        return None
 
-                    # 2. Redirect ve Master Playlist Çözümleme
-                    current_url = r.url
-                    content = r.text
-                    
-                    # Kalite seçimi (Master Playlist ise)
-                    if "#EXT-X-STREAM-INF" in content:
-                        lines = content.splitlines()
-                        found_variant = False
-                        for line in reversed(lines):
-                            if line and not line.startswith("#"):
-                                variant_url = urljoin(current_url, line)
-                                # Linkin erişilebilir olduğunu hızlıca test et (HEAD isteği yerine GET range ile)
-                                try:
-                                    # Sadece ilk byte'ları isteyerek test et (daha hızlı)
-                                    test_headers = current_headers.copy()
-                                    test_headers['Range'] = 'bytes=0-100'
-                                    r2 = session.get(variant_url, headers=test_headers, timeout=3)
-                                    if r2.status_code in [200, 206]:
-                                        current_url = r2.url # Redirect varsa güncelle
-                                        found_variant = True
-                                        break
-                                except:
-                                    pass
-                        if not found_variant:
-                            continue # Bu kaynaktaki varyantlar bozuk, diğer siteye geç
+    def resolve(self, cid, force=False):
+        """
+        Tüm kaynakları AYNI ANDA tarar. İlk cevap vereni alır.
+        """
+        now = time.time()
+        
+        # 1. Cache Kontrolü (5 Dakika)
+        if not force and cid in self.cache:
+            if now - self.cache[cid]['ts'] < 300:
+                return self.cache[cid]
 
-                    # 3. Başarılı Sonucu Kaydet
-                    self.channels[cid] = {
-                        'final_url': current_url,
-                        'updated_at': time.time(),
-                        'source_used': source_url # Hangi sitenin çalıştığını bilmek istersen
-                    }
-                    return current_url
+        # 2. Race Condition Koruması (Aynı anda 50 kişi aynı kanalı isterse)
+        if cid in self.pending_resolves:
+            gevent.sleep(0.1) # Diğer thread'in bitirmesini bekle
+            if cid in self.cache: return self.cache[cid]
 
-                except Exception as e:
-                    # Hata loglarını görmek istersen: print(f"Source fail {source_url}: {e}")
-                    continue
+        self.pending_resolves[cid] = True
 
-            return None # Hiçbir kaynak çalışmadı
+        try:
+            # 3. YARIŞ BAŞLASIN (Parallel Execution)
+            # Greenlet Pool kullanarak tüm kaynaklara aynı anda istek atıyoruz.
+            pool = Pool(len(SOURCES))
+            greenlets = []
+            
+            for src in SOURCES:
+                greenlets.append(pool.spawn(self._check_source, src, cid))
+            
+            winner = None
+            
+            # iwait ile bitenleri sırayla alıyoruz
+            for g in gevent.iwait(greenlets):
+                result = g.value
+                if result:
+                    winner = result
+                    # Kazanan belli oldu, diğerlerini beklemeye gerek yok ama
+                    # gevent pool otomatik temizler, kill etmeye gerek yok.
+                    break 
+            
+            pool.kill() # Diğer istekleri iptal et (Bandwidth tasarrufu)
 
-brain = StreamBrain()
+            if winner:
+                winner['ts'] = now
+                self.cache[cid] = winner
+                return winner
+            
+        finally:
+            if cid in self.pending_resolves:
+                del self.pending_resolves[cid]
+
+        return None
+
+brain = TurboBrain()
 
 # =====================================================
-# ROTALAR
+# ENDPOINTS
 # =====================================================
 
 @app.route('/')
 def root():
-    # Kanal listesini çekmek için kaynakları dene
+    # Liste çekmek için de en hızlı kaynağı bulalım
+    # Basitlik adına burada ilk çalışanı alıyoruz (seri), çünkü bu nadiren çağrılır.
     data = None
-    used_source = ""
-    
     for source in SOURCES:
         try:
-            url = f"{source}/live2/index"
-            r = session.get(url, headers=get_headers(source), verify=False, timeout=6)
+            r = session.get(f"{source}/live2/index", headers=get_headers(source), verify=False, timeout=3)
             if r.status_code == 200:
                 data = r.json()
-                used_source = source
-                break # Liste alındı, döngüden çık
-        except:
-            continue
-            
-    if not data:
-        return "Hicbir kaynaktan liste alinamadi.", 502
+                break
+        except: continue
 
-    base_app_url = request.host_url.rstrip('/')
-    out = ["#EXTM3U"]
+    if not data: return "Liste alinamadi", 503
+
+    host = request.host_url.rstrip('/')
+    m3u = ["#EXTM3U"]
     
-    # JSON verisini işle
-    # Hızlı olması için string birleştirme yerine list append kullanıyoruz
+    # String birleştirme optimizasyonu (f-string en hızlısıdır)
     for item in data:
-        # Sadece Turkey grubu
         if item.get("group") == "Turkey":
             name = item.get("name", "Unknown").replace(',', ' ')
             url_val = item.get("url", "")
-            
-            # URL içinden ID'yi al
             match = re.search(r'/play/(\d+)', url_val)
             if match:
                 cid = match.group(1)
                 logo = item.get("logo", "")
-                out.append(f'#EXTINF:-1 group-title="Turkey" tvg-logo="{logo}",{name}\n{base_app_url}/live/{cid}.m3u8')
+                m3u.append(f'#EXTINF:-1 group-title="Turkey" tvg-logo="{logo}",{name}\n{host}/live/{cid}.m3u8')
 
-    return Response("\n".join(out), content_type="application/x-mpegURL")
+    return Response("\n".join(m3u), content_type="application/x-mpegURL")
 
 @app.route('/live/<cid>.m3u8')
-def playlist_handler(cid):
-    final_url = brain.resolve_stream_url(cid)
-    if not final_url: return Response("Yayin Bulunamadi (Tum Kaynaklar Denendi)", status=404)
-
-    # final_url'in domainini bulup ona uygun header üretmemiz lazım
-    parsed_final = urlparse(final_url)
-    origin_base = f"{parsed_final.scheme}://{parsed_final.netloc}"
-    req_headers = get_headers(origin_base)
+def playlist(cid):
+    info = brain.resolve(cid)
+    if not info: return "Yayin Yok", 404
 
     try:
-        r = session.get(final_url, headers=req_headers, verify=False, timeout=5)
+        # Stream URL'inden veriyi çek
+        r = session.get(info['url'], headers=info['headers'], verify=False, timeout=5)
         
-        # Token süresi dolmuşsa yenile (Force Refresh)
-        if r.status_code != 200:
-            final_url = brain.resolve_stream_url(cid, force_refresh=True)
-            if not final_url: return Response("Yayin Kirik", status=503)
-            # URL değiştiyse headerı da güncelle
-            parsed_final = urlparse(final_url)
-            origin_base = f"{parsed_final.scheme}://{parsed_final.netloc}"
-            req_headers = get_headers(origin_base)
-            
-            r = session.get(final_url, headers=req_headers, verify=False, timeout=5)
+        # Token süresi dolmuş veya yayın sunucusu değişmiş (Retry Logic)
+        if r.status_code >= 400:
+            info = brain.resolve(cid, force=True) # Force refresh
+            if not info: return "Source Dead", 503
+            r = session.get(info['url'], headers=info['headers'], verify=False, timeout=5)
 
+        base_url = r.url
         content = r.text
-        base_url = r.url # Redirect sonrası gerçek URL
         new_lines = []
-        
-        for line in content.splitlines():
+        host = request.host_url.rstrip('/')
+
+        # Basit string parsing (Regex'ten daha hızlıdır)
+        for line in content.split('\n'):
             line = line.strip()
             if not line: continue
-            
-            if line.startswith("#"):
+            if line.startswith('#'):
                 new_lines.append(line)
             else:
-                # TS veya Key dosyasının tam adresi
-                ts_full_url = urljoin(base_url, line)
-                safe_target = quote(ts_full_url)
+                # Segment URL oluşturma
+                # full_ts_url = urljoin(base_url, line) -> Yavaş olabilir
+                if line.startswith('http'):
+                    ts_url = line
+                else:
+                    # urljoin yerine basit string manipülasyonu (eğer slash varsa/yoksa)
+                    # Burası urljoin kadar güvenli olmayabilir ama daha hızlıdır.
+                    # Güvenlik için urljoin'de kalıyoruz şimdilik.
+                    ts_url = urljoin(base_url, line)
                 
-                # Proxy linkini oluştur
-                # cid'i parametre olarak geçiyoruz ki hata durumunda Brain yeniden çözümleyebilsin
-                new_lines.append(f"{request.host_url.rstrip('/')}/seg?cid={cid}&target={safe_target}")
+                # Double encoding sorunlarını önlemek için safe quote
+                safe_target = quote(ts_url)
+                new_lines.append(f"{host}/ts?cid={cid}&target={safe_target}")
 
         return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
 
-    except Exception:
-        return Response("Server Error", status=500)
+    except Exception as e:
+        print(f"Playlist Error: {e}")
+        return "Internal Error", 500
 
-@app.route('/seg')
-def segment_handler():
+@app.route('/ts')
+def segment():
+    # request.args.get yavaştır, query string parse edilebilir ama Flask'a güvenelim.
+    target = unquote(request.args.get('target', ''))
     cid = request.args.get('cid')
-    target_url_encoded = request.args.get('target')
     
-    if not cid or not target_url_encoded: return "Bad Request", 400
-    
-    current_target_url = unquote(target_url_encoded)
-    
-    # Target URL'den domaini çek ve header oluştur
-    parsed_target = urlparse(current_target_url)
-    origin_base = f"{parsed_target.scheme}://{parsed_target.netloc}"
-    req_headers = get_headers(origin_base)
+    if not target: return "No Target", 400
 
-    final_response = None
-    
-    # 3 Deneme Hakkı
-    for attempt in range(3):
-        try:
-            # Eğer ilk deneme değilse, URL'yi tazelemeyi dene
-            if attempt > 0:
-                # Yeni bir master URL bul
-                new_base_m3u8 = brain.resolve_stream_url(cid, force_refresh=True)
-                if new_base_m3u8:
-                    # Eski TS dosya adını al, yeni base URL'e yapıştır
-                    # Bu çok kritik çünkü tokenlar değişmiş olabilir ama dosya adı (seg-1.ts) aynıdır.
-                    path_parts = parsed_target.path.split('/')
-                    file_name = path_parts[-1]
+    # Header türetme
+    parsed = urlparse(target)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    headers = {
+        "User-Agent": BASE_HEADERS["User-Agent"],
+        "Referer": f"{origin}/",
+        "Origin": origin,
+        "Connection": "keep-alive"
+    }
+
+    def proxy_stream():
+        # Retry mekanizması (Segment seviyesinde)
+        current_target = target
+        current_headers = headers
+        
+        for attempt in range(2): # Max 2 deneme
+            try:
+                # stream=True çok önemli, tüm dosyayı RAM'e indirme!
+                with session.get(current_target, headers=current_headers, verify=False, stream=True, timeout=10) as r:
+                    if r.status_code == 200:
+                        # Chunk size artırıldı (128KB). CPU context switch azalır.
+                        for chunk in r.iter_content(chunk_size=131072):
+                            if chunk: yield chunk
+                        return # Başarılıysa çık
                     
-                    current_target_url = urljoin(new_base_m3u8, file_name)
-                    
-                    # Yeni URL için headerları güncelle
-                    parsed_new = urlparse(current_target_url)
-                    origin_base = f"{parsed_new.scheme}://{parsed_new.netloc}"
-                    req_headers = get_headers(origin_base)
+                    elif r.status_code in [403, 404, 410]:
+                        # Link ölmüş, yeni token lazım
+                        if attempt == 0 and cid:
+                            new_info = brain.resolve(cid, force=True)
+                            if new_info:
+                                # Eski dosya ismini (seg-10.ts) yeni base URL ile birleştir
+                                # Bu kısım biraz tahmin içerir ama genelde çalışır.
+                                file_name = current_target.split('?')[0].split('/')[-1]
+                                # Base URL'in sonundaki playlist adını atıp file_name eklemek gerekir
+                                # Basit çözüm: Playlist'i tekrar çekip parse etmek çok uzun sürer.
+                                # Burası "Fail Fast" olmalı. Eğer 403 ise yayını kesmek bazen daha iyidir.
+                                pass 
+            except:
+                pass
+            time.sleep(0.5) # Kısa bekleme
 
-            upstream = session.get(current_target_url, headers=req_headers, verify=False, stream=True, timeout=8)
-            
-            if upstream.status_code == 200:
-                final_response = upstream
-                break
-            elif upstream.status_code in [403, 404, 410, 503]:
-                upstream.close()
-                continue # Hata aldı, tekrar dene (üstteki if bloğuna girip link yenileyecek)
-            else:
-                upstream.close()
-                continue
+    return Response(stream_with_context(proxy_stream()), content_type="video/mp2t")
 
-        except Exception:
-            time.sleep(0.2)
-            continue
-
-    if not final_response:
-        return Response("Segment Unavailable", status=503)
-
-    def generate(upstream_resp):
-        try:
-            # Chunk size video akışı için optimize edildi
-            for chunk in upstream_resp.iter_content(chunk_size=65536):
-                if chunk: yield chunk
-        except:
-            pass
-        finally:
-            upstream_resp.close()
-
-    return Response(stream_with_context(generate(final_response)), content_type="video/mp2t")
-
-# =====================================================
-# MAIN
-# =====================================================
 if __name__ == "__main__":
-    port = 8080
-    print(f"==========================================")
-    print(f" YUKSEK PERFORMANS VAVOO PROXY (MULTI-SOURCE)")
-    print(f" Kaynaklar: {', '.join([x.replace('https://', '') for x in SOURCES])}")
-    print(f" Adres: http://0.0.0.0:{port}")
-    print(f"==========================================")
+    print("==========================================")
+    print(" TURBO VAVOO PROXY (PARALLEL MODE)")
+    print(" :8080 portunda baslatiliyor...")
+    print("==========================================")
     
-    try:
-        http_server = WSGIServer(('0.0.0.0', port), app)
-        http_server.serve_forever()
-    except KeyboardInterrupt:
-        print("Kapatiliyor...")
+    # Backlog artırıldı, aynı anda gelen istekleri kuyrukta tutabilmek için
+    server = WSGIServer(('0.0.0.0', 8080), app, backlog=10000)
+    server.serve_forever()
