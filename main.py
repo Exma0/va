@@ -8,7 +8,7 @@ from gevent import pool
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
-from collections import OrderedDict # RAM Cache yönetimi için eklendi
+from collections import OrderedDict
 
 try:
     import ujson as json
@@ -19,16 +19,16 @@ SOURCES = [
     "https://vavoo.to"
 ]
 
-USER_AGENT = "VAVOO/3.1.20"
+# iPad User-Agent
+USER_AGENT = "Mozilla/5.0 (iPad; CPU OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
 PORT = 8080
 
 # --- RAM AYARLARI ---
-# Hafızada kaç adet .ts dosyası tutulacak? 
-# Ortalama 1 ts dosyası 1-2 MB'dır. 1000 dosya yaklaşık 1GB - 2GB RAM yer.
-MAX_CACHE_ITEMS = 500 
+MAX_CACHE_ITEMS = 600  # Kapasite biraz artırıldı
 TS_CACHE = OrderedDict()
 
-gc.set_threshold(700, 10, 10)
+# Çöp toplayıcı ayarı (Donmayı azaltmak için biraz daha gevşetildi)
+gc.set_threshold(900, 15, 15)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -47,6 +47,7 @@ adapter = requests.adapters.HTTPAdapter(
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
 session.headers.update({
     "User-Agent": USER_AGENT,
     "Connection": "keep-alive"
@@ -74,33 +75,49 @@ def fetch_playlist_content(cid):
             continue
     return None, None, None
 
-# Hem anlık gönderen hem de RAM'e yazan fonksiyon
+# --- YENİ OPTİMİZE EDİLMİŞ STREAM FONKSİYONU ---
 def stream_and_cache_generator(r, cache_key):
-    data_buffer = bytearray()
+    # Bytearray yerine List kullanıyoruz (Python'da append daha hızlıdır, donmayı engeller)
+    chunks = [] 
     try:
-        # Chunk boyutu 8KB yapıldı, hızlı aktarım için
+        # Chunk boyutu 8KB. Veri geldikçe kullanıcıya at, aynı anda listeye ekle.
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
-                data_buffer.extend(chunk) # Hafızaya ekle
-                yield chunk # Kullanıcıya gönder
+                chunks.append(chunk) # RAM için biriktir (Hızlı işlem)
+                yield chunk          # Kullanıcıya gönder (Bekletme yapmaz)
         
-        # Akış başarıyla biterse Cache'e kaydet
-        if len(TS_CACHE) >= MAX_CACHE_ITEMS:
-            TS_CACHE.popitem(last=False) # En eskiyi sil
+        # --- YAYIN BİTTİ, ŞİMDİ RAM'E KAYDETME ZAMANI ---
         
-        TS_CACHE[cache_key] = bytes(data_buffer) # Byte'a çevirip sakla
+        # Önce Cache doluluğunu kontrol et
+        # Eğer sınır aşıldıysa, EN ESKİ (en az kullanılan) veriyi sil.
+        while len(TS_CACHE) >= MAX_CACHE_ITEMS:
+            # last=False -> FIFO mantığı (En başa eklenen en eskidir)
+            TS_CACHE.popitem(last=False) 
+        
+        # Parçaları tek bir byte verisine dönüştür ve kaydet
+        full_content = b"".join(chunks)
+        TS_CACHE[cache_key] = full_content
+        
+        # Yeni eklenen veriyi "En Yeni" olarak işaretle (Sona taşımana gerek yok, yeni eklenen zaten sondadır)
         
     except Exception as e:
-        # Hata olursa cache'e yarım dosya kaydetme
         pass
     finally:
         r.close()
+        # Hafızayı temiz tutmak için listeyi boşalt
+        del chunks
 
 def proxy_stream(url, timeout_settings):
-    # Önce RAM kontrolü
+    # 1. RAM KONTROLÜ VE LRU (Least Recently Used) GÜNCELLEMESİ
     if url in TS_CACHE:
+        # EĞER BU VERİ İSTENMİŞSE, BU POPÜLERDİR. 
+        # SİLİNMEMESİ İÇİN LİSTENİN SONUNA (EN YENİ KISMINA) TAŞIYORUZ.
+        TS_CACHE.move_to_end(url)
+        
+        # Direkt RAM'den ver, sunucuya gitme
         return Response(TS_CACHE[url], content_type="video/mp2t")
 
+    # RAM'de yoksa sunucudan çek
     try:
         r = session.get(url, stream=True, verify=False, timeout=timeout_settings)
         if r.status_code == 200:
@@ -168,13 +185,12 @@ def segment_handler():
     
     original_target = unquote(url_enc)
     
-    # 1. ADIM: RAM KONTROLÜ
-    # Eğer bu dosya daha önce indirilmişse RAM'den ver ve çık.
+    # 1. RAM KONTROLÜ (Fonksiyon içinde LRU mantığı çalışacak)
     if original_target in TS_CACHE:
-        # Cache hit - direkt hafızadan gönder
+        TS_CACHE.move_to_end(original_target) # Bunu taze tut
         return Response(TS_CACHE[original_target], content_type="video/mp2t")
 
-    TIMEOUT_SETTINGS = (3, 10) # Connect timeout 3, Read timeout 10
+    TIMEOUT_SETTINGS = (3, 10)
 
     path_part = None
     target_domain = None
@@ -189,30 +205,25 @@ def segment_handler():
     if not target_domain:
         return proxy_stream(original_target, TIMEOUT_SETTINGS)
 
-    # 2. ADIM: İLK DENEME (Kaynak Site)
+    # 2. İLK DENEME
     try:
         r = session.get(original_target, stream=True, verify=False, timeout=TIMEOUT_SETTINGS)
         if r.status_code == 200:
-            # Hem stream et hem cache'e yaz
             return Response(stream_with_context(stream_and_cache_generator(r, original_target)), 
                           content_type="video/mp2t")
         r.close()
     except:
         pass 
         
-    # 3. ADIM: YEDEK KAYNAKLAR (Failover)
+    # 3. YEDEK KAYNAKLAR
     if path_part:
         for src in SOURCES:
             if src == target_domain: continue
             
             new_target = src + path_part
-            # Yedek kaynak için de cache kontrolü yapalım mı? 
-            # Genelde URL farklı olduğu için gerekmez ama new_target ile kontrol edilebilir.
-            
             try:
                 r = session.get(new_target, stream=True, verify=False, timeout=TIMEOUT_SETTINGS)
                 if r.status_code == 200:
-                    # Başarılı kaynağı stream et ve cache'e (orijinal url anahtarıyla değil yeni url ile) yaz
                     return Response(stream_with_context(stream_and_cache_generator(r, original_target)), 
                                   content_type="video/mp2t")
                 r.close()
@@ -222,12 +233,12 @@ def segment_handler():
     return Response("Source Error", 502)
 
 if __name__ == "__main__":
-    # Worker sayısını RAM kullanımına göre dikkatli ayarla
     worker_pool = pool.Pool(1000)
     server = WSGIServer(('0.0.0.0', PORT), app, spawn=worker_pool, log=None)
     try:
         print(f"Server baslatildi: Port {PORT}")
-        print(f"RAM Cache limiti: {MAX_CACHE_ITEMS} segment")
+        print(f"RAM Cache limiti: {MAX_CACHE_ITEMS} segment (LRU Aktif)")
+        print("Akıllı Cache Sistemi: Devrede")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
