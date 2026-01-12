@@ -17,7 +17,7 @@ session.headers.update({"User-Agent": USER_AGENT})
 
 def proxy_req(url):
     try:
-        r = session.get(url, stream=True, verify=False, timeout=5)
+        r = session.get(url, stream=True, verify=False, timeout=None)
         if r.status_code == 200:
             return Response(stream_with_context(r.iter_content(chunk_size=8192)), content_type="video/mp2t")
         r.close()
