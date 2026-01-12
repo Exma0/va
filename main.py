@@ -1,7 +1,6 @@
 # ==============================================================================
-# VAVOO PROXY - TACHYON EDITION (V2 - BUGFIX)
-# Fix: Double Extension Error (.m3u8.m3u8)
-# Status: Production Ready
+# VAVOO PROXY - SINGULARITY V3 (ANTI-FREEZE EDITION)
+# Fix: 0-Byte Segment Detection | Dynamic Source Ban | Stalled Stream Killer
 # ==============================================================================
 
 from gevent import monkey
@@ -16,10 +15,9 @@ from gevent import pool, event, spawn, sleep, lock
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
-from collections import deque
 
 # ------------------------------------------------------------------------------
-# 1. KERNEL & MEMORY OPTIMIZATION
+# 1. AYARLAR & MEMORY
 # ------------------------------------------------------------------------------
 gc.set_threshold(70000, 10, 10)
 
@@ -32,21 +30,21 @@ SOURCES = [
 
 B_NEWLINE = b"\n"
 B_EXTM3U = b"#EXTM3U"
+MIN_SEGMENT_SIZE = 1024 # 1KB'dan küçük TS dosyası hatalıdır
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
-# Logları sustur
 import logging
 logging.getLogger('werkzeug').disabled = True
 app.logger.disabled = True
 
 # ------------------------------------------------------------------------------
-# 2. NETWORK STACK
+# 2. NETWORK KATMANI
 # ------------------------------------------------------------------------------
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=4000,
-    pool_maxsize=40000,
+    pool_connections=1000,
+    pool_maxsize=10000,
     max_retries=0,
     pool_block=False
 )
@@ -65,43 +63,76 @@ def get_headers(base_url):
     return HEADERS_MEM[base_url]
 
 # ------------------------------------------------------------------------------
-# 3. TACHYON ENGINE
+# 3. ZEKİ BEYİN (TOXIC DETECTION)
 # ------------------------------------------------------------------------------
-class TachyonBrain:
+class AntiFreezeBrain:
     def __init__(self):
         self.cache = {}         
         self.prefetch = {}      
         self.lock = lock.RLock()
-        self.scores = {src: 10.0 for src in SOURCES} 
+        # Kaynak Puanları (Düşük = İyi)
+        self.scores = {src: 10.0 for src in SOURCES}
+        # Hatalı Sunucular (Kara Liste)
+        self.toxic_sources = {} 
+        
         spawn(self._cleaner)
 
     def _cleaner(self):
         while True:
-            sleep(10)
+            sleep(5)
             now = time.time()
             with self.lock:
-                expired = [k for k, v in self.prefetch.items() if now - v['ts'] > 20]
+                # Prefetch temizliği
+                expired = [k for k, v in self.prefetch.items() if now - v['ts'] > 15]
                 for k in expired: del self.prefetch[k]
+                
+                # Kara listeden af (30 saniye sonra affet)
+                for src in list(self.toxic_sources.keys()):
+                    if now - self.toxic_sources[src] > 30:
+                        del self.toxic_sources[src]
+                        self.scores[src] = 50.0 # Cezalı başlangıç puanı
 
-    def _speculative_loader(self, ts_url, headers):
+    def report_toxic(self, source):
+        """Sunucuyu zehirli ilan et ve puanını yok et"""
+        with self.lock:
+            self.toxic_sources[source] = time.time()
+            self.scores[source] += 99999.0 # Sonsuz ceza
+
+    def get_best_sources(self):
+        """Sadece sağlıklı kaynakları döndür"""
+        valid = [s for s in SOURCES if s not in self.toxic_sources]
+        if not valid: # Hepsi ölüyse mecburen hepsini aç
+            self.toxic_sources.clear()
+            valid = SOURCES
+        return sorted(valid, key=lambda s: self.scores[s])
+
+    def _speculative_loader(self, ts_url, headers, source):
+        """Ön-İndirme (0-Byte kontrolü ile)"""
         try:
             with session.get(ts_url, headers=headers, verify=False, stream=True, timeout=5) as r:
                 if r.status_code == 200:
                     data = r.content
-                    with self.lock:
-                        self.prefetch[ts_url] = {'data': data, 'ts': time.time()}
+                    if len(data) > MIN_SEGMENT_SIZE:
+                        with self.lock:
+                            self.prefetch[ts_url] = {'data': data, 'ts': time.time()}
+                    else:
+                        # Boş dosya gönderdi -> BAN
+                        self.report_toxic(source)
         except: pass
 
     def _worker(self, source, cid, result_box):
         try:
+            # Zehirli kaynaksa uğraşma
+            if source in self.toxic_sources: return
+
             url = f"{source}/play/{cid}/index.m3u8"
             h = get_headers(source)
             t0 = time.time()
             
-            with session.get(url, headers=h, verify=False, timeout=(0.8, 2.0)) as r:
-                if r.status_code == 200:
+            with session.get(url, headers=h, verify=False, timeout=(1.0, 3.0)) as r:
+                if r.status_code == 200 and len(r.content) > 100:
                     dt = (time.time() - t0) * 1000
-                    self.scores[source] = (self.scores[source] * 0.7) + (dt * 0.3)
+                    self.scores[source] = (self.scores[source] * 0.8) + (dt * 0.2)
                     
                     if not result_box.ready():
                         result_box.set({
@@ -111,33 +142,33 @@ class TachyonBrain:
                             'headers': h
                         })
                 else:
-                    self.scores[source] += 5000
+                    self.report_toxic(source)
         except:
-            self.scores[source] += 10000
+            self.report_toxic(source)
 
     def resolve_playlist(self, cid):
         now = time.time()
-        # ID temizliği (Her ihtimale karşı)
         cid = cid.replace('.m3u8', '')
 
+        # Cache valid ise dön
         if cid in self.cache:
             entry = self.cache[cid]
             if now < entry['expires']: return entry['data']
 
-        sorted_src = sorted(SOURCES, key=lambda s: self.scores[s])
-        candidates = sorted_src[:2]
+        candidates = self.get_best_sources()[:3] # En iyi 3 kaynağı dene
         
         result_box = event.AsyncResult()
-        pool_ = pool.Pool(2)
+        pool_ = pool.Pool(3)
         for src in candidates:
             pool_.spawn(self._worker, src, cid, result_box)
         
         try:
-            winner = result_box.get(timeout=2.5)
+            winner = result_box.get(timeout=3.5)
             pool_.kill(block=False)
             
             if winner:
                 self.cache[cid] = {'expires': now + 300, 'data': winner}
+                # TACHYON PRE-FETCH
                 try:
                     lines = winner['content'].split(B_NEWLINE)
                     first_ts = None
@@ -147,26 +178,27 @@ class TachyonBrain:
                             else: first_ts = f"{winner['base']}/{line.decode()}"
                             break
                     if first_ts:
-                        spawn(self._speculative_loader, first_ts, winner['headers'])
+                        # Kaynak bilgisiyle birlikte gönder ki hata olursa banlayalım
+                        spawn(self._speculative_loader, first_ts, winner['headers'], winner['source'])
                 except: pass
                 return winner
         except:
             pool_.kill(block=False)
         return None
 
-brain = TachyonBrain()
+brain = AntiFreezeBrain()
 
 # ------------------------------------------------------------------------------
-# 4. ENDPOINTS (FIXED PARSING LOGIC)
+# 4. ENDPOINTS
 # ------------------------------------------------------------------------------
 
 @app.route('/')
 def root():
-    # Liste kaynağı bul
-    best_src = min(SOURCES, key=lambda s: brain.scores[s])
+    # En iyi kaynaktan liste al
+    best_src = brain.get_best_sources()[0]
     data = None
     try:
-        r = session.get(f"{best_src}/live2/index", verify=False, timeout=2)
+        r = session.get(f"{best_src}/live2/index", verify=False, timeout=3)
         if r.status_code == 200: data = r.json()
     except: pass
     
@@ -174,7 +206,7 @@ def root():
         for src in SOURCES:
             if src == best_src: continue
             try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=2)
+                r = session.get(f"{src}/live2/index", verify=False, timeout=3)
                 if r.status_code == 200: 
                     data = r.json()
                     break
@@ -184,35 +216,20 @@ def root():
 
     host_b = request.host_url.rstrip('/').encode()
     out = [B_EXTM3U]
-    b_group = "Turkey"
     
     for item in data:
-        if item.get("group") == b_group or item.get("group") == "Turkey":
+        if item.get("group") == "Turkey":
             try:
                 u = item['url']
-                # === BURASI DÜZELTİLDİ ===
-                # URL formatları değişken olabilir:
-                # 1. .../play/12345/index.m3u8
-                # 2. .../play/12345.m3u8
-                
-                # /play/'den sonrasını al
+                # Parsing Fix
                 part = u.split('/play/')[-1]
-                
-                cid = ""
-                if '/' in part:
-                    # Klasör yapısı ise (12345/index.m3u8) -> 12345 al
-                    cid = part.split('/')[0]
-                else:
-                    # Dosya yapısı ise (12345.m3u8) -> uzantıyı temizle
-                    cid = part.replace('.m3u8', '')
-                
-                # Ekstra güvenlik: Noktadan sonrasını at (eğer hala varsa)
+                if '/' in part: cid = part.split('/')[0]
+                else: cid = part.replace('.m3u8', '')
                 if '.' in cid: cid = cid.split('.')[0]
                 
                 if cid:
                     name = item['name'].replace(',', ' ')
                     out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
-                    # Burada artık temiz cid kullanıyoruz, çift uzantı olmaz
                     out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
             except: pass
 
@@ -220,12 +237,7 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    # Gelen istek: /live/12345.m3u8 -> cid = 12345
-    # Flask <cid> kısmını alır, uzantı route'da tanımlı olduğu için gelmez.
-    # Ancak eğer istek /live/12345.m3u8.m3u8 gelirse, Flask 12345.m3u8 olarak alır.
-    # Bu yüzden burada da temizlik yapıyoruz.
     clean_cid = cid.replace('.m3u8', '')
-    
     info = brain.resolve_playlist(clean_cid)
     if not info: return Response("Not Found", 404)
 
@@ -247,6 +259,9 @@ def playlist_handler(cid):
             if line.startswith(b'http'): target = line
             else: target = base_b + b'/' + line
             
+            # Kaynak bilgisini (source) URL'e gömüyoruz ki TS handler hangi sunucudan geldiğini bilsin
+            # Bu sayede o sunucu hata verirse banlayabiliriz.
+            # Ancak URL'i çok uzatmamak için Brain cache'den bulacağız.
             safe_target = quote(target).encode()
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
@@ -260,13 +275,13 @@ def segment_handler():
     
     target = unquote(url_enc)
     
-    # 1. TACHYON CHECK (RAM Hit)
+    # 1. RAM HIT (Tachyon)
     with brain.lock:
         if target in brain.prefetch:
             data = brain.prefetch.pop(target)['data']
             return Response(data, content_type="video/mp2t")
 
-    # 2. CACHE MISS
+    # Domain bul
     try:
         slash3 = target.find('/', 8)
         origin = target[:slash3]
@@ -279,31 +294,57 @@ def segment_handler():
         "Connection": "keep-alive"
     }
 
-    def stream_direct():
-        try:
-            with session.get(target, headers=headers, verify=False, stream=True, timeout=10) as r:
-                if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=131072):
-                        yield chunk
-                    return
+    # Hangi kaynağa ait olduğunu bul (Domain eşleştirme)
+    # Bu, o kaynağı banlamak için gerekli
+    current_source = None
+    for s in SOURCES:
+        if s in origin:
+            current_source = s
+            break
 
+    def stream_checked():
+        total_bytes = 0
+        try:
+            # Timeout artırıldı ama read timeout eklendi
+            with session.get(target, headers=headers, verify=False, stream=True, timeout=(2, 5)) as r:
+                if r.status_code == 200:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            total_bytes += len(chunk)
+                            yield chunk
+                    
+                    # YAYIN SONU KONTROLÜ
+                    # Eğer tüm işlem bittiğinde elimizde 1KB'dan az veri varsa -> FAKE SUCCESS
+                    if total_bytes < MIN_SEGMENT_SIZE and current_source:
+                        brain.report_toxic(current_source)
+                else:
+                    if current_source: brain.report_toxic(current_source)
+        except:
+            if current_source: brain.report_toxic(current_source)
+            # Hata durumunda Fallback (Yedek Sunucuya Geçiş)
             if cid:
                 clean_cid = cid.replace('.m3u8', '')
+                # Cache sil ki yeni sunucu bulsun
                 if clean_cid in brain.cache: del brain.cache[clean_cid]
-                info = brain.resolve_playlist(clean_cid)
-                if info:
+                
+                # Yeni sunucu bul
+                new_info = brain.resolve_playlist(clean_cid)
+                if new_info:
                     fname = target.rsplit('/', 1)[-1].split('?')[0]
-                    new_target = f"{info['base']}/{fname}"
-                    with session.get(new_target, headers=info['headers'], verify=False, stream=True, timeout=8) as r2:
-                        if r2.status_code == 200:
-                            for chunk in r2.iter_content(chunk_size=131072):
-                                yield chunk
-        except: pass
+                    new_target = f"{new_info['base']}/{fname}"
+                    # Tekrar dene
+                    try:
+                        with session.get(new_target, headers=new_info['headers'], verify=False, stream=True, timeout=5) as r2:
+                            if r2.status_code == 200:
+                                for chunk in r2.iter_content(chunk_size=65536):
+                                    yield chunk
+                    except: pass
 
-    return Response(stream_with_context(stream_direct()), content_type="video/mp2t")
+    return Response(stream_with_context(stream_checked()), content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► VAVOO TACHYON V2 (BUGFIXED)")
+    print(f" ► VAVOO ANTI-FREEZE V3")
+    print(f" ► FEATURE: 0-BYTE SEGMENT BAN SYSTEM")
     print(f" ► LISTENING: 8080")
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
