@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO PROXY - TITAN V3 (HYPERSPEED EDITION)
+# VAVOO PROXY - TITAN V3 (STABLE STREAM EDITION)
 # Tech: Low-Level Socket Streaming | Async Learning | Zero-Latency Loop
-# Status: OPTIMIZED (Maksimum Hız)
+# Status: FIXED (Donma Sorunu Giderildi)
 # ==============================================================================
 
 from gevent import monkey
@@ -47,19 +47,20 @@ session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=1000,
     pool_maxsize=10000,
-    max_retries=0,
+    max_retries=1,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
 # RAW Pool Manager (Video Akışı İçin - Requests'ten çok daha hızlıdır)
+# DÜZELTME: Timeout süreleri artırıldı (Connect: 5s, Read: 20s)
 http_pool = urllib3.PoolManager(
     num_pools=1000,
     maxsize=10000,
     block=False,
     retries=False,
-    timeout=urllib3.Timeout(connect=2.0, read=7.0)
+    timeout=urllib3.Timeout(connect=5.0, read=20.0)
 )
 
 HEADERS_MEM = {}
@@ -127,7 +128,7 @@ class NeuralBrain:
 
         primary = self.predict_best_source()
         
-        # Tek işçi ile hızlı deneme (Parallel overhead'inden kaçınmak için önce en iyiyi dene)
+        # Tek işçi ile hızlı deneme
         try:
             res = self._fetch_playlist(primary, cid_clean)
             if res: 
@@ -142,7 +143,7 @@ class NeuralBrain:
             if src == primary: continue
             try:
                 res = self._fetch_playlist(src, cid_clean)
-                if res:
+                if res: 
                     self.cache[cid_clean] = {'expires': now + 300, 'data': res}
                     self.train_async(src, True)
                     return res
@@ -153,7 +154,7 @@ class NeuralBrain:
     def _fetch_playlist(self, src, cid):
         url = f"{src}/play/{cid}/index.m3u8"
         h = get_headers(src)
-        with session.get(url, headers=h, verify=False, timeout=2.0) as r:
+        with session.get(url, headers=h, verify=False, timeout=3.0) as r:
             if r.status_code == 200:
                 return {
                     'content': r.content,
@@ -176,7 +177,7 @@ def root():
     
     # Önce en iyi kaynaktan dene
     try:
-        r = session.get(f"{best_src}/live2/index", verify=False, timeout=3)
+        r = session.get(f"{best_src}/live2/index", verify=False, timeout=4)
         if r.status_code == 200: data = r.json()
     except: pass
     
@@ -185,7 +186,7 @@ def root():
         for src in SOURCES:
             if src == best_src: continue
             try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=3)
+                r = session.get(f"{src}/live2/index", verify=False, timeout=4)
                 if r.status_code == 200: 
                     data = r.json()
                     break
@@ -200,9 +201,7 @@ def root():
     for item in data:
         if item.get("group") == "Turkey":
             try:
-                # String işlemleri CPU yorar, minimuma indirildi
                 u = item['url']
-                # Hızlı split
                 cid = u.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                 
                 name = item['name'].replace(',', ' ')
@@ -223,24 +222,21 @@ def playlist_handler(cid):
     
     out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
     
-    # Byte işlemi yaparak string decode/encode maliyetinden kaçıyoruz
     lines = info['content'].split(b'\n')
     for line in lines:
         line = line.strip()
         if not line: continue
         
-        if line[0] == 35: # b'#' karakterinin ASCII kodu 35
+        if line[0] == 35: # b'#'
             if b"EXT-X-KEY" in line: continue
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
         else:
-            # Segment URL oluşturma
             if line.startswith(b'http'): 
                 target = line
             else: 
                 target = base_b + b'/' + line
             
-            # URL encode işlemini sadece target için yap
             safe_target = quote(target).encode()
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
@@ -248,14 +244,14 @@ def playlist_handler(cid):
 
 @app.route('/ts')
 def segment_handler():
-    # Argument parsing'i hızlandır
+    # Argument parsing
     args = request.args
     url_enc = args.get('url')
     if not url_enc: return "Bad", 400
     
     target = unquote(url_enc)
     
-    # Basit kaynak tespiti
+    # Kaynak Tespiti
     current_source = "https://vavoo.to"
     for s in SOURCES:
         if s in target:
@@ -264,35 +260,47 @@ def segment_handler():
             
     h = get_headers(current_source)
 
+    # --- BAĞLANTIYI BAŞLAT ---
+    try:
+        # preload_content=False: Hafızaya almadan direkt pipe açar
+        req = http_pool.request('GET', target, headers=h, preload_content=False)
+    except Exception:
+        brain.train_async(current_source, False)
+        return Response("Gateway Error", 502)
+
+    if req.status != 200:
+        req.release_conn()
+        brain.train_async(current_source, False)
+        return Response("Source Error", 502)
+
+    # --- DÜZELTME: Header İletimi ---
+    # OTT Player'ın yayını tanıması için gerekli başlıkları iletiyoruz
+    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+    headers = [
+        (k, v) for k, v in req.headers.items()
+        if k.lower() not in excluded_headers
+    ]
+
     def fast_stream():
         try:
-            # Requests yerine URLLIB3 kullanıyoruz (Daha Hızlı)
-            # preload_content=False ile hafızaya almadan stream eder
-            r = http_pool.request('GET', target, headers=h, preload_content=False)
-            
-            if r.status == 200:
-                brain.train_async(current_source, True)
-                # Tampon boyutunu artırdık: 128KB (Daha az döngü = Daha az CPU)
-                # stream() metodu generator döner
-                for chunk in r.stream(131072):
-                    yield chunk
-                r.release_conn()
-            else:
-                r.release_conn()
-                brain.train_async(current_source, False)
-                # Hata durumunda (403/404/500) boş dön, client retry yapsın
-                # Proxy'nin retry yapması canlı yayında gecikme yaratır.
-                return 
-
+            brain.train_async(current_source, True)
+            # --- DÜZELTME: Chunk Size ---
+            # 128KB yerine 8KB (8192 byte) kullanarak buffer sorununu çözüyoruz.
+            # Veri bekletilmeden anlık olarak client'a akar.
+            for chunk in req.stream(8192):
+                yield chunk
         except Exception:
             brain.train_async(current_source, False)
-            return
+        finally:
+            # İş bitince veya hata çıkınca bağlantıyı havuza iade et
+            try: req.release_conn()
+            except: pass
 
-    return Response(stream_with_context(fast_stream()), content_type="video/mp2t")
+    return Response(stream_with_context(fast_stream()), headers=headers, content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► TITAN V3 - HYPERSPEED EDITION")
-    print(f" ► MODE: Raw Socket Streaming")
+    print(f" ► TITAN V3 - STABLE EDITION")
+    print(f" ► MODE: Optimized Streaming (8KB Chunks)")
     # Log: None (Maksimum performans)
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
