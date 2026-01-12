@@ -1,6 +1,3 @@
-# ==============================================================================
-# VAVOO SINGULARITY: HIGH-PERFORMANCE MINIMAL
-# ==============================================================================
 from gevent import monkey; monkey.patch_all()
 import requests, re, urllib3
 from gevent.pywsgi import WSGIServer
@@ -11,14 +8,12 @@ from urllib.parse import quote, unquote, urljoin
 urllib3.disable_warnings()
 app = Flask(__name__)
 
-# --- CONFIG & PRE-COMPILE ---
 URLS = ["https://vavoo.to", "https://huhu.to", "https://oha.to", "https://kool.to"]
 UA = {"User-Agent": "Vavoo/2.6"}
 SESS = requests.Session(); SESS.headers.update(UA)
 RE_CID = re.compile(r'/play/([\w\.]+)')
 RE_KEY = re.compile(r'URI="([^"]+)"')
 
-# --- CORE LOGIC (PARALLEL FETCH) ---
 def check_src(args):
     url, cid = args
     try:
@@ -27,17 +22,14 @@ def check_src(args):
     except: return None
 
 def get_best_stream(cid):
-    # Tum sunuculari ayni anda tarar, ilk calisani alir
     pool = Pool(len(URLS))
     for res in pool.imap_unordered(check_src, [(u, cid) for u in URLS]):
         if res: pool.kill(); return res
     return None, None
 
-# --- ROUTES ---
 @app.route('/')
 def index():
     m3u = ["#EXTM3U"]
-    # Liste cekimi icin de paralel tarama
     pool = Pool(len(URLS))
     data = None
     for res in pool.imap_unordered(lambda u: SESS.get(f"{u}/live2/index", verify=False, timeout=5), URLS):
@@ -48,7 +40,6 @@ def index():
     if not data: return Response("Service Unavailable", 503)
 
     host = request.host_url.rstrip('/')
-    # List comprehension ile hizli isleme
     turkey_chns = [x for x in data if x.get("group") == "Turkey"]
     
     for item in turkey_chns:
@@ -92,6 +83,5 @@ def proxy():
     return Response(stream_with_context(generate()), content_type="video/mp2t" if ".ts" in url else "application/octet-stream")
 
 if __name__ == "__main__":
-    print("🚀 Vavoo High-Perf: :8080 calisiyor...")
     try: WSGIServer(('0.0.0.0', 8080), app, log=None).serve_forever()
     except: pass
