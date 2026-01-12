@@ -16,7 +16,7 @@ from urllib.parse import quote, unquote
 # Vavoo altyapısı bu User-Agent ile daha stabil çalışır
 USER_AGENT = "VAVOO/2.6"
 SOURCES = [
-    "https://huhu.to"
+    "https://vavoo.to"
 ]
 
 # Çöp toplama mekanizmasını rahatlat (Mikro takılmaları önler)
