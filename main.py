@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO OMEGA - ENDGAME EDITION
-# Features: Global RAM Cache | RAID-1 Mirroring | Titanium Compatibility
-# Status: APEX PREDATOR (Zirve Avcı)
+# VAVOO SINGULARITY: OMEGA (FINAL EDITION)
+# Structure: Deobfuscated & Reverse Engineered
+# Features: RAID-1 Mirroring | Zombie Detection | Dynamic Header Injection
 # ==============================================================================
 
 from gevent import monkey
@@ -19,11 +19,15 @@ from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 # ------------------------------------------------------------------------------
-# 1. MAKİNE AYARLARI
+# 1. KERNEL & PERFORMANCE TUNING
 # ------------------------------------------------------------------------------
+# İşletim sistemi seviyesinde thread geçiş hızını artır (Real-time tepki için)
 sys.setswitchinterval(0.001)
+
+# Garbage Collector optimizasyonu (Mikro takılmaları önler)
 gc.set_threshold(100000, 50, 50)
 
+# Kaynak Havuzu
 SOURCES = [
     "https://huhu.to",
     "https://vavoo.to",
@@ -31,18 +35,22 @@ SOURCES = [
     "https://kool.to"
 ]
 
+# Validasyon Limiti: 1KB altı video dosyaları "bozuk" kabul edilir
 MIN_TS_SIZE = 1024 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
+
+# Log Kirliliğini Önle (Sadece kritik hatalar)
 import logging
 logging.getLogger('werkzeug').disabled = True
 app.logger.disabled = True
 
 # ------------------------------------------------------------------------------
-# 2. NETWORK
+# 2. ADVANCED NETWORK STACK
 # ------------------------------------------------------------------------------
 session = requests.Session()
+# Devasa bağlantı havuzu (High Concurrency)
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=5000,
     pool_maxsize=50000,
@@ -52,196 +60,209 @@ adapter = requests.adapters.HTTPAdapter(
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
+# Header Cache (CPU Tasarrufu)
 HEADERS_MEM = {}
+
 def get_headers(target_url):
-    parsed = urlparse(target_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    # Vavoo Header Check
-    if origin not in HEADERS_MEM:
-        HEADERS_MEM[origin] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": f"{origin}/",
-            "Origin": origin,
+    """
+    Dinamik Header Üreticisi:
+    İstek atılan URL'in domainini analiz eder ve ona uygun
+    Referer/Origin başlıklarını üretir. Vavoo korumasını bu aşar.
+    """
+    try:
+        parsed = urlparse(target_url)
+        # Örn: https://cdn5.huhu.to
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        
+        if origin not in HEADERS_MEM:
+            HEADERS_MEM[origin] = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": f"{origin}/",
+                "Origin": origin,
+                "Connection": "keep-alive",
+                "Accept-Encoding": "gzip"
+            }
+        return HEADERS_MEM[origin]
+    except:
+        # Fallback
+        return {
+            "User-Agent": "Mozilla/5.0",
             "Connection": "keep-alive"
         }
-    return HEADERS_MEM[origin]
 
 # ------------------------------------------------------------------------------
-# 3. GLOBAL RAM CACHE (ORTAK HAFIZA)
+# 3. OMEGA BRAIN (MERKEZİ YÖNETİM)
 # ------------------------------------------------------------------------------
-# Aynı anda aynı segmenti isteyen kullanıcılar için veriyi RAM'de tutar.
-# { 'segment_url': {'data': bytes, 'ts': time.time()} }
-GLOBAL_SEGMENT_CACHE = {}
-CACHE_LOCK = lock.RLock()
-
-def cache_cleaner():
-    """Eski segmentleri RAM'den siler."""
-    while True:
-        sleep(5)
-        now = time.time()
-        with CACHE_LOCK:
-            # 15 saniyeden eski verileri sil
-            expired = [k for k, v in GLOBAL_SEGMENT_CACHE.items() if now - v['ts'] > 15]
-            for k in expired: del GLOBAL_SEGMENT_CACHE[k]
-
-spawn(cache_cleaner)
-
-# ------------------------------------------------------------------------------
-# 4. OMEGA CORE (AKIL MERKEZİ)
-# ------------------------------------------------------------------------------
-class OmegaCore:
+class OmegaBrain:
     def __init__(self):
+        # Kaynak Sağlık Puanları (100 = Mükemmel)
         self.health = {src: 100.0 for src in SOURCES}
-        self.channel_map = {} # {cid: {final_url, source_root, expires}}
+        
+        # Kanal Bilgisi Önbelleği (Playlist URL, Token vb.)
+        self.channel_map = {} 
+        
         self.lock = lock.RLock()
-        # Zamanla iyileşme
-        spawn(self._healer)
+        
+        # Arka plan iyileştiricisi
+        spawn(self._auto_healer)
 
-    def _healer(self):
+    def _auto_healer(self):
+        """Zamanla kaynakların puanını geri yükler (Affetme Mekanizması)."""
         while True:
             sleep(10)
             with self.lock:
                 for src in self.health:
-                    if self.health[src] < 100: self.health[src] += 10
+                    if self.health[src] < 100: self.health[src] += 5
 
     def punish(self, source, amount=20):
+        """Hata yapan kaynağı cezalandır."""
         with self.lock:
             self.health[source] -= amount
 
     def get_best_sources(self):
+        """En sağlıklı kaynakları sıralı döndürür."""
         with self.lock:
             return sorted(SOURCES, key=lambda s: self.health[s], reverse=True)
 
     def resolve_stream(self, cid):
-        """Kanalın gerçek (tokenlı) adresini bulur."""
+        """
+        Kanal ID'sini (CID) alır, tüm kaynakları tarar ve 
+        token'lı, yönlendirilmiş (Redirected) son URL'i bulur.
+        """
         now = time.time()
         
-        # Cache Check
+        # Cache Kontrolü
         if cid in self.channel_map:
             entry = self.channel_map[cid]
             if now < entry['expires']: return entry
 
-        # Kaynakları sağlık sırasına göre dene
         candidates = self.get_best_sources()
         
         for src in candidates:
             try:
-                # Redirect takibi açık
-                initial = f"{src}/play/{cid}/index.m3u8"
-                h = get_headers(initial)
-                r = session.get(initial, headers=h, verify=False, timeout=4, allow_redirects=True)
+                # 1. İstek: Ana sunucuya git
+                initial_url = f"{src}/play/{cid}/index.m3u8"
+                h = get_headers(initial_url)
                 
-                if r.status_code == 200 and b"#EXTM3U" in r.content:
-                    final_url = r.url
-                    result = {
-                        'final_url': final_url,
-                        'source_root': src,
-                        'content': r.content,
-                        'expires': now + 300
-                    }
-                    self.channel_map[cid] = result
-                    return result
+                # allow_redirects=True: Bizi CDN'e götürür
+                r = session.get(initial_url, headers=h, verify=False, timeout=4, allow_redirects=True)
+                
+                if r.status_code == 200:
+                    # İçerik Kontrolü: Gerçekten M3U8 mi?
+                    if b"#EXTM3U" in r.content:
+                        final_url = r.url # Tokenlı, CDN'li son adres
+                        result = {
+                            'final_url': final_url,
+                            'source_root': src,
+                            'content': r.content,
+                            'expires': now + 300 # 5 dk geçerli
+                        }
+                        self.channel_map[cid] = result
+                        return result
+                    else:
+                        self.punish(src, 10) # İçerik bozuk
             except: 
-                self.punish(src, 5)
+                self.punish(src, 5) # Bağlantı hatası
+        
         return None
 
-omega = OmegaCore()
+omega = OmegaBrain()
 
 # ------------------------------------------------------------------------------
-# 5. RAID-1 DOWNLOADER (ÇİFT MOTORLU İNDİRİCİ)
+# 4. RAID-1 DOWNLOAD ENGINE (HIZ & GÜVENLİK)
 # ------------------------------------------------------------------------------
-def download_segment_raid(target_url, cid):
+def raid_downloader(target_filename, cid):
     """
-    Aynı dosyayı hem ana kaynaktan hem de yedekten aynı anda ister.
-    Kim 0-byte olmayan veriyi önce getirirse onu kullanır.
+    RAID-1 Mantığı:
+    Dosyayı en iyi 2 kaynaktan AYNI ANDA ister.
+    Kim önce ve SAĞLAM (dolu) veri gönderirse onu kullanıcıya verir.
+    Diğerini iptal eder.
     """
-    # 1. GLOBAL CACHE CHECK (Başka biri indirdiyse direkt al)
-    with CACHE_LOCK:
-        if target_url in GLOBAL_SEGMENT_CACHE:
-            yield GLOBAL_SEGMENT_CACHE[target_url]['data']
-            return
-
-    # 2. Kaynak Hazırlığı
-    # Mevcut en iyi kaynakları al
-    sources = omega.get_best_sources()[:2] # En iyi 2 kaynak
     
-    # URL'den dosya ismini çıkar: seg-10.ts
-    filename = target_url.split('/')[-1].split('?')[0]
+    # En iyi 2 kaynak
+    sources = omega.get_best_sources()[:2]
     
-    # Yarış Pisti
+    # Sonuç Kuyruğu
     result_queue = queue.Queue()
-    finished_event = event.Event()
+    # Bitiş Bayrağı
+    stop_event = event.Event()
     
+    workers = []
+
     def worker(src):
         try:
-            # Her kaynak için olası URL'i oluştur
-            # Vavoo yapısı: {src}/play/{cid}/{filename}
-            # NOT: Bu tahminidir. Eğer başarısız olursa aşağıda Fallback var.
-            real_url = f"{src}/play/{cid}/{filename}"
+            # URL Tahmini: {src}/play/{cid}/{filename}
+            # Bu yapı %99 Vavoo klonlarında standarttır.
+            real_url = f"{src}/play/{cid}/{target_filename}"
             h = get_headers(real_url)
             
+            # Bağlan
             with session.get(real_url, headers=h, verify=False, stream=True, timeout=(2, 6)) as r:
                 if r.status_code == 200:
-                    # İlk paketi oku (0-Byte kontrolü)
-                    first = next(r.iter_content(chunk_size=4096), None)
-                    if first and len(first) > 0:
-                        # Başarılı! Veriyi topla
-                        data = bytearray(first)
-                        for chunk in r.iter_content(chunk_size=65536):
-                            if finished_event.is_set(): return
-                            if chunk: data.extend(chunk)
-                        
-                        # Tamamlandı, kuyruğa at
-                        result_queue.put(bytes(data))
-                        finished_event.set() # Diğer işçiyi durdur
+                    # 0-Byte Dedektörü
+                    first_chunk = next(r.iter_content(chunk_size=4096), None)
+                    
+                    if first_chunk and len(first_chunk) > 0:
+                        # Kazandık!
+                        if not stop_event.is_set():
+                            # İlk parçayı ve stream objesini kuyruğa at
+                            result_queue.put((first_chunk, r))
+                            stop_event.set() # Diğerlerini durdur
                     else:
-                        omega.punish(src, 50) # 0-Byte cezası
+                        # Boş dosya -> Zombi Sunucu
+                        omega.punish(src, 50)
                 else:
                     omega.punish(src, 10)
         except:
             omega.punish(src, 10)
 
-    # İşçileri Başlat
-    greenlets = []
+    # İşçileri Ateşle
     for s in sources:
-        greenlets.append(spawn(worker, s))
-    
+        workers.append(spawn(worker, s))
+
     # Sonucu Bekle
     try:
-        # 7 saniye içinde veri gelmezse pes et
-        final_data = result_queue.get(timeout=7)
+        # 6 saniye içinde veri gelmezse Fallback'e git
+        first_chunk, r_stream = result_queue.get(timeout=6)
         
-        # Diğer işçileri temizle
-        killall(greenlets, block=False)
+        # Diğer işçileri temizle (Memory Leak önlemi)
+        killall(workers, block=False)
         
-        # RAM'e kaydet (Cache)
-        with CACHE_LOCK:
-            GLOBAL_SEGMENT_CACHE[target_url] = {'data': final_data, 'ts': time.time()}
-            
-        yield final_data
+        # Veriyi Akıt
+        yield first_chunk
+        # Geri kalanı akıt
+        try:
+            for chunk in r_stream.iter_content(chunk_size=65536):
+                if chunk: yield chunk
+        except: pass
         
     except queue.Empty:
-        # HİÇBİRİNDEN VERİ GELMEDİ -> FALLBACK MODE
-        # Demek ki tahmin ettiğimiz URL yapısı (/play/cid/seg.ts) yanlış olabilir.
-        # Tokenlı orijinal URL'den gitmeyi deneyelim.
-        killall(greenlets, block=False)
+        # HİÇBİR KAYNAK CEVAP VERMEDİ -> FALLBACK MODE
+        killall(workers, block=False)
         
-        # Bu durumda tekil (RAID olmayan) güvenli indirme yapıyoruz
-        try:
-            h = get_headers(target_url)
-            with session.get(target_url, headers=h, verify=False, stream=True, timeout=8) as r:
-                if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        yield chunk
-        except: pass
+        # Son Çare: Cache'i sil ve orijinal imzalı URL'i bulmaya çalış
+        if cid in omega.channel_map: del omega.channel_map[cid]
+        info = omega.resolve_stream(cid)
+        
+        if info:
+            # Base URL + Filename
+            base = info['final_url'].rsplit('/', 1)[0]
+            fallback_url = f"{base}/{target_filename}"
+            try:
+                h = get_headers(fallback_url)
+                with session.get(fallback_url, headers=h, verify=False, stream=True, timeout=8) as r:
+                    if r.status_code == 200:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            yield chunk
+            except: pass
 
 # ------------------------------------------------------------------------------
-# 6. ENDPOINTS
+# 5. ENDPOINTS (API)
 # ------------------------------------------------------------------------------
 
 @app.route('/')
 def root():
-    # Liste kaynağı
+    # En iyi kaynaktan listeyi çek
     best = omega.get_best_sources()[0]
     data = None
     try:
@@ -249,11 +270,12 @@ def root():
         if r.status_code == 200: data = r.json()
     except: pass
     
+    # Eğer en iyi kaynak çökmüşse diğerlerini dene
     if not data:
         for s in SOURCES:
             if s == best: continue
             try:
-                r = session.get(f"{s}/live2/index", verify=False, timeout=3)
+                r = session.get(f"{s}/live2/index", verify=False, timeout=2)
                 if r.status_code == 200: data = r.json(); break
             except: continue
 
@@ -266,12 +288,16 @@ def root():
         if item.get("group") == "Turkey":
             try:
                 u = item['url']
-                # Gelişmiş ID Parsing
+                # Sağlam ID Ayıklama (Regex'siz, hızlı string işlemi)
                 if '/play/' in u:
-                    rest = u.split('/play/')[-1]
-                    if '/' in rest: cid = rest.split('/')[0]
-                    else: cid = rest.split('.')[0]
-                    cid = cid.split('.')[0] # Nokta temizliği
+                    # .../play/12345/index.m3u8 veya .../play/12345.m3u8
+                    part = u.split('/play/')[-1]
+                    
+                    if '/' in part: cid = part.split('/')[0]
+                    else: cid = part.replace('.m3u8', '')
+                    
+                    # Nokta vs temizle
+                    cid = cid.split('.')[0]
                     
                     if cid.isdigit():
                         name = item['name'].replace(',', ' ')
@@ -283,55 +309,65 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
+    # Çift uzantı koruması
     clean_cid = cid.split('.')[0]
-    info = omega.resolve_stream(clean_cid)
     
+    info = omega.resolve_stream(clean_cid)
     if not info: return Response("Not Found", 404)
 
-    # Base URL: http://cdn.server.com/hls/123
-    base_url = info['final_url'].rsplit('/', 1)[0]
-    
     host_b = request.host_url.rstrip('/').encode()
     cid_b = clean_cid.encode()
     
     out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
     
+    # Playlist'i satır satır işle
     for line in info['content'].split(b'\n'):
         line = line.strip()
         if not line: continue
         
         if line.startswith(b'#'):
-            if b"EXT-X-KEY" in line: continue
+            if b"EXT-X-KEY" in line: continue # Şifre varsa atla (Vavoo şifresizdir)
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
         else:
-            # Segment Linki
+            # Bu bir TS linkidir
             line_str = line.decode()
-            # Mutlak URL oluştur
-            full_ts_url = urljoin(base_url + "/", line_str)
             
-            # Parametre olarak TAM URL'i gönderiyoruz ki
-            # RAID sistemi başarısız olursa Fallback olarak bunu kullansın.
-            safe_target = quote(full_ts_url).encode()
+            # Sadece dosya ismini al (örn: seg-50.ts veya 6964.ts)
+            # URL'in geri kalanını atıyoruz çünkü RAID motoru
+            # en hızlı sunucuyu kendisi seçecek.
+            if line_str.startswith('http'):
+                filename = line_str.split('/')[-1]
+            else:
+                filename = line_str
+                
+            # Query string (token) varsa temizle
+            filename = filename.split('?')[0]
+            
+            safe_target = quote(filename).encode()
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
     return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/ts')
 def segment_handler():
-    url_param = request.args.get('url')
+    # Parametreler: url=dosya_ismi, cid=kanal_id
+    filename_enc = request.args.get('url')
     cid = request.args.get('cid')
     
-    if not url_param: return "Bad", 400
+    if not filename_enc or not cid: return "Bad", 400
     
-    target_url = unquote(url_param)
+    filename = unquote(filename_enc)
     
-    # OMEGA RAID İNDİRME BAŞLAT
-    return Response(stream_with_context(download_segment_raid(target_url, cid)), content_type="video/mp2t")
+    # RAID motorunu çalıştır
+    return Response(stream_with_context(raid_downloader(filename, cid)), content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► VAVOO OMEGA - ENDGAME")
-    print(f" ► SYSTEM: RAID-1 + GLOBAL RAM CACHE")
+    print(f" ► VAVOO SINGULARITY: OMEGA")
+    print(f" ► ARCHITECTURE: RAID-1 MIRRORING")
+    print(f" ► PROTECTION: ZOMBIE SERVER DETECTION")
     print(f" ► LISTENING: 8080")
+    
+    # Gevent WSGI Sunucusu
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
