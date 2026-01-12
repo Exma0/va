@@ -1,9 +1,3 @@
-# ==============================================================================
-# VAVOO PROXY - TITAN V3 (STABLE STREAM EDITION)
-# Tech: Low-Level Socket Streaming | Async Learning | Zero-Latency Loop
-# Status: FIXED (Donma Sorunu Giderildi)
-# ==============================================================================
-
 from gevent import monkey
 monkey.patch_all()
 
@@ -16,10 +10,8 @@ from gevent import pool, event, spawn, lock
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
+import logging
 
-# ------------------------------------------------------------------------------
-# 1. SİSTEM AYARLARI
-# ------------------------------------------------------------------------------
 gc.set_threshold(100000, 50, 50)
 
 SOURCES = [
@@ -29,20 +21,13 @@ SOURCES = [
     "https://kool.to"
 ]
 
-# Urllib3 Uyarılarını Kapat
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-# Logları tamamen kapat (Hız için kritik)
-import logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app.logger.disabled = True
 
-# ------------------------------------------------------------------------------
-# 2. HIZLI NETWORK HAVUZU (RAW SOCKET POOL)
-# ------------------------------------------------------------------------------
-# Requests Session (Sadece Playlist ve API için)
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=1000,
@@ -53,8 +38,6 @@ adapter = requests.adapters.HTTPAdapter(
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# RAW Pool Manager (Video Akışı İçin - Requests'ten çok daha hızlıdır)
-# DÜZELTME: Timeout süreleri artırıldı (Connect: 5s, Read: 20s)
 http_pool = urllib3.PoolManager(
     num_pools=1000,
     maxsize=10000,
@@ -73,28 +56,22 @@ def get_headers(base_url):
         }
     return HEADERS_MEM[base_url]
 
-# ------------------------------------------------------------------------------
-# 3. LIGHTWEIGHT NEURAL BRAIN (HAFİFLETİLMİŞ BEYİN)
-# ------------------------------------------------------------------------------
 class NeuralBrain:
     def __init__(self):
-        self.weights = {src: 5.0 for src in SOURCES} # 0.1 - 10.0 arası
+        self.weights = {src: 5.0 for src in SOURCES}
         self.cache = {} 
-        self.lock = lock.RLock() # Thread safe lock
+        self.lock = lock.RLock()
         
-        # Unutma faktörü (Memory Decay)
         spawn(self._memory_decay)
 
     def _memory_decay(self):
         while True:
             time.sleep(15)
-            # Kilit (Lock) kullanmadan yaklaşık değerlerle işlem yap (Hız için)
             for src in SOURCES:
                 if self.weights[src] > 5.0: self.weights[src] *= 0.99
                 if self.weights[src] < 5.0: self.weights[src] *= 1.01
 
     def train_async(self, source, success):
-        """Eğitimi ana akışı bloklamadan arka planda yap"""
         spawn(self._train_worker, source, success)
 
     def _train_worker(self, source, success):
@@ -105,8 +82,6 @@ class NeuralBrain:
                 self.weights[source] = max(0.1, self.weights[source] * 0.5)
 
     def predict_best_source(self):
-        """En iyi kaynağı seçer (Hızlı versiyon)"""
-        # Hız için kopyalama yapmadan işlem yapmaya çalışıyoruz
         try:
             total = sum(self.weights.values())
             pick = random.uniform(0, total)
@@ -121,14 +96,12 @@ class NeuralBrain:
         now = time.time()
         cid_clean = cid.replace('.m3u8', '')
         
-        # Cache Check
         if cid_clean in self.cache:
             entry = self.cache[cid_clean]
             if now < entry['expires']: return entry['data']
 
         primary = self.predict_best_source()
         
-        # Tek işçi ile hızlı deneme
         try:
             res = self._fetch_playlist(primary, cid_clean)
             if res: 
@@ -138,7 +111,6 @@ class NeuralBrain:
         except:
             self.train_async(primary, False)
 
-        # Eğer favori başarısızsa, diğerlerini dene
         for src in SOURCES:
             if src == primary: continue
             try:
@@ -165,23 +137,16 @@ class NeuralBrain:
 
 brain = NeuralBrain()
 
-# ------------------------------------------------------------------------------
-# 4. ENDPOINTS
-# ------------------------------------------------------------------------------
-
 @app.route('/')
 def root():
-    # En basit haliyle listeyi çek
     best_src = brain.predict_best_source()
     data = None
     
-    # Önce en iyi kaynaktan dene
     try:
         r = session.get(f"{best_src}/live2/index", verify=False, timeout=4)
         if r.status_code == 200: data = r.json()
     except: pass
     
-    # Olmazsa yedeklerden biri
     if not data:
         for src in SOURCES:
             if src == best_src: continue
@@ -197,7 +162,6 @@ def root():
     host_b = request.host_url.rstrip('/').encode()
     out = [b"#EXTM3U"]
     
-    # String birleştirme maliyetini azaltmak için list append kullanıyoruz
     for item in data:
         if item.get("group") == "Turkey":
             try:
@@ -220,14 +184,14 @@ def playlist_handler(cid):
     host_b = request.host_url.rstrip('/').encode()
     cid_b = cid.replace('.m3u8', '').encode()
     
-    out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
+    out = [b"#EXTM3U", b"#EXT-X-VERSION:3"]
     
     lines = info['content'].split(b'\n')
     for line in lines:
         line = line.strip()
         if not line: continue
         
-        if line[0] == 35: # b'#'
+        if line[0] == 35:
             if b"EXT-X-KEY" in line: continue
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
@@ -244,15 +208,13 @@ def playlist_handler(cid):
 
 @app.route('/ts')
 def segment_handler():
-    # Argument parsing
     args = request.args
     url_enc = args.get('url')
     if not url_enc: return "Bad", 400
     
     target = unquote(url_enc)
     
-    # Kaynak Tespiti
-    current_source = "https://vavoo.to"
+    current_source = "https://huhu.to"
     for s in SOURCES:
         if s in target:
             current_source = s
@@ -260,9 +222,7 @@ def segment_handler():
             
     h = get_headers(current_source)
 
-    # --- BAĞLANTIYI BAŞLAT ---
     try:
-        # preload_content=False: Hafızaya almadan direkt pipe açar
         req = http_pool.request('GET', target, headers=h, preload_content=False)
     except Exception:
         brain.train_async(current_source, False)
@@ -273,8 +233,6 @@ def segment_handler():
         brain.train_async(current_source, False)
         return Response("Source Error", 502)
 
-    # --- DÜZELTME: Header İletimi ---
-    # OTT Player'ın yayını tanıması için gerekli başlıkları iletiyoruz
     excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
     headers = [
         (k, v) for k, v in req.headers.items()
@@ -284,15 +242,11 @@ def segment_handler():
     def fast_stream():
         try:
             brain.train_async(current_source, True)
-            # --- DÜZELTME: Chunk Size ---
-            # 128KB yerine 8KB (8192 byte) kullanarak buffer sorununu çözüyoruz.
-            # Veri bekletilmeden anlık olarak client'a akar.
             for chunk in req.stream(8192):
                 yield chunk
         except Exception:
             brain.train_async(current_source, False)
         finally:
-            # İş bitince veya hata çıkınca bağlantıyı havuza iade et
             try: req.release_conn()
             except: pass
 
@@ -301,6 +255,5 @@ def segment_handler():
 if __name__ == "__main__":
     print(f" ► TITAN V3 - STABLE EDITION")
     print(f" ► MODE: Optimized Streaming (8KB Chunks)")
-    # Log: None (Maksimum performans)
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
