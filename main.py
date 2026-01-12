@@ -12,7 +12,8 @@ from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
 import logging
 
-gc.set_threshold(100000, 50, 50)
+# GC ayarları streaming için optimize edildi (Takılmaları önler)
+gc.set_threshold(700, 10, 10)
 
 SOURCES = [
     "https://huhu.to",
@@ -28,22 +29,24 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app.logger.disabled = True
 
+# Session ayarları
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=1000,
-    pool_maxsize=10000,
+    pool_connections=200,    # Aşırı yüksek değerler RAM şişirir, 200 idealdir
+    pool_maxsize=200,
     max_retries=1,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
+# urllib3 PoolManager - Daha hızlı raw soket işlemleri için
 http_pool = urllib3.PoolManager(
-    num_pools=1000,
-    maxsize=10000,
+    num_pools=100,
+    maxsize=200,
     block=False,
     retries=False,
-    timeout=urllib3.Timeout(connect=5.0, read=20.0)
+    timeout=urllib3.Timeout(connect=3.0, read=15.0) # Timeoutlar sıkılaştırıldı
 )
 
 HEADERS_MEM = {}
@@ -52,7 +55,8 @@ def get_headers(base_url):
         HEADERS_MEM[base_url] = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": f"{base_url}/",
-            "Connection": "keep-alive"
+            "Connection": "keep-alive",
+            "Accept-Encoding": "identity" # Sıkıştırma istemiyoruz, direkt stream istiyoruz
         }
     return HEADERS_MEM[base_url]
 
@@ -126,13 +130,15 @@ class NeuralBrain:
     def _fetch_playlist(self, src, cid):
         url = f"{src}/play/{cid}/index.m3u8"
         h = get_headers(src)
-        with session.get(url, headers=h, verify=False, timeout=3.0) as r:
-            if r.status_code == 200:
-                return {
-                    'content': r.content,
-                    'base': r.url.rsplit('/', 1)[0],
-                    'source': src
-                }
+        try:
+            with session.get(url, headers=h, verify=False, timeout=4.0) as r:
+                if r.status_code == 200:
+                    return {
+                        'content': r.content,
+                        'base': r.url.rsplit('/', 1)[0],
+                        'source': src
+                    }
+        except: pass
         return None
 
 brain = NeuralBrain()
@@ -191,7 +197,7 @@ def playlist_handler(cid):
         line = line.strip()
         if not line: continue
         
-        if line[0] == 35:
+        if line[0] == 35: # # karakteri
             if b"EXT-X-KEY" in line: continue
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
@@ -223,6 +229,7 @@ def segment_handler():
     h = get_headers(current_source)
 
     try:
+        # preload_content=False, stream modudur.
         req = http_pool.request('GET', target, headers=h, preload_content=False)
     except Exception:
         brain.train_async(current_source, False)
@@ -240,12 +247,16 @@ def segment_handler():
     ]
 
     def fast_stream():
+        # Yapay zeka eğitimini asenkron başlat, stream'i bekletme
+        brain.train_async(current_source, True) 
         try:
-            brain.train_async(current_source, True)
-            for chunk in req.stream(8192):
-                yield chunk
+            # KRİTİK DÜZELTME: Chunk size 8192 -> 65536 (64KB)
+            # Daha büyük chunk = Daha az CPU kesintisi = Akıcı Yayın
+            for chunk in req.stream(65536): 
+                if chunk:
+                    yield chunk
         except Exception:
-            brain.train_async(current_source, False)
+            pass # Bağlantı koptuysa sessizce bitir
         finally:
             try: req.release_conn()
             except: pass
@@ -253,7 +264,8 @@ def segment_handler():
     return Response(stream_with_context(fast_stream()), headers=headers, content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► TITAN V3 - STABLE EDITION")
-    print(f" ► MODE: Optimized Streaming (8KB Chunks)")
-    server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
+    print(f" ► TITAN V3 - STABLE & FLUID EDITION")
+    print(f" ► MODE: High Performance Streaming (64KB Chunks)")
+    # Backlog artırıldı, yoğun isteklerde kuyruk dolmasın
+    server = WSGIServer(('0.0.0.0', 8080), app, backlog=100000, log=None)
     server.serve_forever()
