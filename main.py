@@ -1,535 +1,253 @@
 # ==============================================================================
-# VAVOO SINGULARITY: OMEGA (FINAL PATCHED VERSION)
-# Status: PRODUCTION READY
-# Fixes Applied:
-# - Key URL Path Resolution (Nested keys fixed)
-# - Raid Downloader Null-Pointer Protection
-# - Regex Robustness for ID parsing
-# - Full Thread-Safety & Cleanup
+# VAVOO SINGULARITY: FINAL RELEASE (FULL STABLE)
+# ==============================================================================
+# KURULUM: pip install flask gevent requests
+# CALISTIRMA: python vavoo.py
 # ==============================================================================
 
+# 1. GEVENT PATCH (MUTLAKA EN BASTA OLMALI)
 from gevent import monkey
 monkey.patch_all()
 
+import sys
+import re
 import time
+import json
 import requests
 import urllib3
-import gc
-import sys
-import signal
-import re
-import json
-from collections import OrderedDict
-from gevent import pool, event, spawn, sleep, lock, queue, killall
-from gevent.lock import BoundedSemaphore
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 # ------------------------------------------------------------------------------
-# KERNEL & PERFORMANCE TUNING
+# AYARLAR & SABITLER
 # ------------------------------------------------------------------------------
-sys.setswitchinterval(0.001)
-gc.set_threshold(700, 10, 10)
+app = Flask(__name__)
 
+# SSL Hata mesajlarini gizle (Konsolu temiz tutar)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+# Kaynak Sunucular (Yedekli)
 SOURCES = [
-    "https://huhu.to",
     "https://vavoo.to",
+    "https://huhu.to",
     "https://oha.to",
     "https://kool.to"
 ]
 
-MIN_TS_SIZE = 1024
-MAX_HEADER_CACHE = 100
-MAX_CHANNEL_CACHE = 500
+# Vavoo icin kritik header bilgileri
+HEADERS = {
+    "User-Agent": "Vavoo/2.6",
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive"
+}
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = Flask(__name__)
-
-import logging
-logging.getLogger('werkzeug').disabled = True
-app.logger.disabled = True
-
-DEBUG_MODE = False
+# Buffer boyutu (64KB idealdir)
+CHUNK_SIZE = 64 * 1024
 
 # ------------------------------------------------------------------------------
-# LRU CACHE
-# ------------------------------------------------------------------------------
-class LRUCache:
-    def __init__(self, capacity):
-        self.cache = OrderedDict()
-        self.capacity = capacity
-        self.lock = lock.RLock()
-    
-    def get(self, key):
-        with self.lock:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-                return self.cache[key]
-            return None
-    
-    def put(self, key, value):
-        with self.lock:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            self.cache[key] = value
-            if len(self.cache) > self.capacity:
-                self.cache.popitem(last=False)
-    
-    def delete(self, key):
-        with self.lock:
-            if key in self.cache:
-                del self.cache[key]
-    
-    def clear_expired(self, check_func):
-        with self.lock:
-            expired = [k for k, v in self.cache.items() if not check_func(v)]
-            for k in expired:
-                del self.cache[k]
-            return len(expired)
-
-HEADERS_CACHE = LRUCache(MAX_HEADER_CACHE)
-
-# ------------------------------------------------------------------------------
-# THREAD-SAFE NETWORK STACK
+# NETWORK KATMANI (SESSION POOL)
 # ------------------------------------------------------------------------------
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=50,
-    pool_maxsize=200,
-    max_retries=1,
+    pool_connections=100,
+    pool_maxsize=100,
+    max_retries=2,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
-
-SESSION_LOCK = BoundedSemaphore(200)
-
-def safe_request(url, **kwargs):
-    with SESSION_LOCK:
-        return session.get(url, **kwargs)
-
-def get_headers(target_url):
-    try:
-        parsed = urlparse(target_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        
-        cached = HEADERS_CACHE.get(origin)
-        if cached:
-            return cached
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"{origin}/",
-            "Origin": origin,
-            "Connection": "keep-alive",
-            "Accept-Encoding": "gzip"
-        }
-        
-        HEADERS_CACHE.put(origin, headers)
-        return headers
-    except Exception as e:
-        if DEBUG_MODE:
-            print(f"[HEADER ERROR] {e}")
-        return {"User-Agent": "Mozilla/5.0", "Connection": "keep-alive"}
+session.headers.update(HEADERS)
 
 # ------------------------------------------------------------------------------
-# OMEGA BRAIN
+# YARDIMCI FONKSIYONLAR
 # ------------------------------------------------------------------------------
-class OmegaBrain:
-    def __init__(self):
-        self.health = {src: 100.0 for src in SOURCES}
-        self.channel_map = LRUCache(MAX_CHANNEL_CACHE)
-        self.lock = lock.RLock()
-        spawn(self._auto_healer)
-        spawn(self._cache_cleaner)
 
-    def _auto_healer(self):
-        while True:
-            sleep(10)
-            with self.lock:
-                for src in self.health:
-                    if self.health[src] < 100:
-                        self.health[src] = min(100, self.health[src] + 5)
-
-    def _cache_cleaner(self):
-        while True:
-            sleep(60)
-            now = time.time()
-            cleaned = self.channel_map.clear_expired(lambda v: now < v.get('expires', 0))
-            if DEBUG_MODE and cleaned > 0:
-                print(f"[CACHE CLEAN] {cleaned} expired entries removed")
-
-    def punish(self, source, amount=20):
-        with self.lock:
-            self.health[source] = max(0, self.health[source] - amount)
-            if DEBUG_MODE:
-                print(f"[PUNISH] {source} -> {self.health[source]:.1f}")
-
-    def get_best_sources(self):
-        with self.lock:
-            return sorted(SOURCES, key=lambda s: self.health[s], reverse=True)
-
-    def resolve_stream(self, cid):
-        now = time.time()
-        
-        cached = self.channel_map.get(cid)
-        if cached and now < cached.get('expires', 0):
-            return cached
-
-        candidates = self.get_best_sources()
-        
-        for src in candidates:
-            try:
-                # Not: Eğer kaynak auth gerektiriyorsa (imza/token), burası güncellenmelidir.
-                # Standart yapı için GET isteği bırakıldı.
-                initial_url = f"{src}/play/{cid}/index.m3u8"
-                h = get_headers(initial_url)
-                
-                r = safe_request(initial_url, headers=h, verify=False, timeout=5, allow_redirects=True)
-                
-                if r.status_code == 200:
-                    if b"#EXTM3U" in r.content:
-                        final_url = r.url
-                        result = {
-                            'final_url': final_url,
-                            'source_root': src,
-                            'content': r.content,
-                            'expires': now + 300
-                        }
-                        self.channel_map.put(cid, result)
-                        return result
-                    else:
-                        self.punish(src, 10)
-                else:
-                    self.punish(src, 5)
-            except Exception as e:
-                if DEBUG_MODE:
-                    print(f"[RESOLVE ERROR] {src}: {e}")
-                self.punish(src, 5)
-        
-        return None
-    
-    def invalidate_channel(self, cid):
-        self.channel_map.delete(cid)
-
-omega = OmegaBrain()
-
-# ------------------------------------------------------------------------------
-# RAID-1 DOWNLOADER (FIXED)
-# ------------------------------------------------------------------------------
-def raid_downloader(target_filename, cid):
-    sources = omega.get_best_sources()[:2]
-    result_queue = queue.Queue()
-    stop_event = event.Event()
-    workers = []
-    all_responses = []
-    response_lock = lock.RLock()
-
-    def worker(src):
-        r = None
+def find_working_stream(cid):
+    """
+    Verilen kanal ID (cid) icin calisan sunucuyu bulur ve
+    gerekli imza (token) bilgilerini alir.
+    """
+    for src in SOURCES:
         try:
-            if stop_event.is_set(): 
-                return
+            # Vavoo Play API istegi
+            url = f"{src}/play/{cid}/index.m3u8"
             
-            real_url = f"{src}/play/{cid}/{target_filename}"
-            h = get_headers(real_url)
-            
-            r = safe_request(real_url, headers=h, verify=False, stream=True, timeout=(5, 30))
-            
-            with response_lock:
-                all_responses.append(r)
+            # Redirectlere izin ver (Cunku Vavoo baska sunucuya yonlendirebilir)
+            r = session.get(url, verify=False, timeout=4, allow_redirects=True)
             
             if r.status_code == 200:
-                # İlk chunk'ı oku (buffer check)
-                first_chunk = next(r.iter_content(chunk_size=4096), None)
-                
-                if first_chunk and len(first_chunk) >= MIN_TS_SIZE:
-                    if not stop_event.is_set():
-                        try:
-                            result_queue.put_nowait((first_chunk, r, src))
-                            stop_event.set()
-                            return
-                        except queue.Full:
-                            pass
-                else:
-                    if DEBUG_MODE: 
-                        print(f"[ZOMBIE] {src} empty/small chunk")
-                    omega.punish(src, 50)
-            else:
-                omega.punish(src, 10)
-                
-        except Exception as e:
-            if DEBUG_MODE: 
-                print(f"[WORKER ERROR] {src}: {e}")
-            omega.punish(src, 10)
+                # Icerik kontrolu: Gercekten M3U8 mi dondu?
+                if b"#EXTM3U" in r.content:
+                    return {
+                        "base_url": r.url.rsplit('/', 1)[0], # Link birlestirme icin kok adres
+                        "final_url": r.url,
+                        "content": r.content,
+                        "cookies": r.cookies # Cookie gerekirse tasi
+                    }
+        except Exception:
+            continue
+            
+    return None
 
-    for s in sources:
-        workers.append(spawn(worker, s))
-
-    winning_response = None
-    
+def stream_proxy(url):
+    """
+    Veriyi indirmeden (RAM sisirmeden) dogrudan istemciye akitir.
+    """
     try:
-        first_chunk, r_stream, winning_src = result_queue.get(timeout=8)
-        winning_response = r_stream
-        
-        if DEBUG_MODE: 
-            print(f"[RAID WIN] {winning_src}")
-        
-        # Diğer bağlantıları kapat
-        with response_lock:
-            for resp in all_responses:
-                if resp != r_stream:
-                    try:
-                        resp.close()
-                    except:
-                        pass
-        
-        yield first_chunk
-        
-        # Kazanan stream'den devam et
-        try:
-            for chunk in r_stream.iter_content(chunk_size=65536):
-                if chunk: 
+        # stream=True ile baglantiyi acik tut
+        with session.get(url, stream=True, verify=False, timeout=15) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
                     yield chunk
-        except Exception as e:
-            if DEBUG_MODE: 
-                print(f"[STREAM ERROR] {e}")
-            raise
-        
-    except queue.Empty:
-        if DEBUG_MODE: 
-            print(f"[FALLBACK] {target_filename}")
-        
-        omega.invalidate_channel(cid)
-        
-        # --- FIXED: Fallback sırasında None check eklendi ---
-        info = omega.resolve_stream(cid)
-        if not info:
-             if DEBUG_MODE:
-                 print(f"[FATAL] Fallback resolve failed for {cid}")
-             return
-
-        # urljoin kullanımı ile relative path hatası önlendi
-        fallback_url = urljoin(info['final_url'], target_filename)
-        
-        try:
-            h = get_headers(fallback_url)
-            r = safe_request(fallback_url, headers=h, verify=False, stream=True, timeout=10)
-            
-            with response_lock:
-                all_responses.append(r)
-            
-            if r.status_code == 200:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk: 
-                        yield chunk
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"[FALLBACK ERROR] {e}")
-    
-    finally:
-        # Cleanup garanti
-        with response_lock:
-            for resp in all_responses:
-                try:
-                    resp.close()
-                except:
-                    pass
-        
-        killall(workers, block=False, timeout=1)
+    except Exception:
+        # Baglanti koparsa sessizce bitir
+        pass
 
 # ------------------------------------------------------------------------------
-# ENDPOINTS
+# ENDPOINTLER (WEB SERVISI)
 # ------------------------------------------------------------------------------
 
 @app.route('/')
-def root():
-    best = omega.get_best_sources()[0]
-    data = None
+def index():
+    """
+    Ana Liste: Tum sunuculari tarar, Turkey grubunu suzer ve M3U listesi olusturur.
+    """
+    host = request.host_url.rstrip('/')
+    channels = []
     
-    # 1. En iyi kaynaktan dene
-    try:
-        r = safe_request(f"{best}/live2/index", verify=False, timeout=4)
-        if r.status_code == 200: 
-            data = r.json()
-    except: 
-        pass
-    
-    # 2. Olmazsa diğerlerinden dene
-    if not data:
-        for s in SOURCES:
-            if s == best: 
-                continue
-            try:
-                r = safe_request(f"{s}/live2/index", verify=False, timeout=3)
-                if r.status_code == 200: 
+    # 1. Kanal Listesini Cek
+    for src in SOURCES:
+        try:
+            r = session.get(f"{src}/live2/index", verify=False, timeout=5)
+            if r.status_code == 200:
+                try:
                     data = r.json()
-                    break
-            except: 
-                continue
+                    if data:
+                        channels = data
+                        break # Veriyi aldik, donguden cik
+                except:
+                    continue
+        except:
+            continue
 
-    if not data: 
-        return Response("Service Unavailable", 503)
+    if not channels:
+        return Response("Sunuculara erisilemiyor veya liste bos.", 503)
 
-    host_b = request.host_url.rstrip('/').encode()
-    out = [b"#EXTM3U"]
+    # 2. M3U Dosyasini Olustur
+    m3u_lines = ["#EXTM3U"]
     
-    for item in data:
+    for item in channels:
+        # Sadece Turkey grubu (Istege bagli bu if kaldirilabilir)
         if item.get("group") == "Turkey":
-            try:
-                u = item.get('url', '')
-                # --- FIXED: Regex biraz daha esnek yapıldı ---
-                match = re.search(r'/play/(\d+)', u)
+            name = item.get("name", "Unknown Channel").replace(",", " ")
+            raw_url = item.get("url", "")
+            
+            # URL'den ID ayiklama (Ornek: .../play/123456.m3u8 -> 123456)
+            match = re.search(r'/play/([\w\.]+)', raw_url)
+            if match:
+                cid = match.group(1).replace(".m3u8", "")
                 
-                if match:
-                    part = match.group(1)
-                    name = item.get('name', 'Unknown').replace(',', ' ')
-                    out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
-                    out.append(host_b + b'/live/' + part.encode() + b'.m3u8')
-            except Exception:
-                continue
+                # Logo varsa ekle
+                logo = item.get("logo", "")
+                tvg_id = item.get("id", "")
+                
+                meta = f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-logo="{logo}" group-title="Turkey",{name}'
+                link = f"{host}/live/{cid}.m3u8"
+                
+                m3u_lines.append(meta)
+                m3u_lines.append(link)
 
-    return Response(b"\n".join(out), content_type="application/x-mpegURL")
+    return Response("\n".join(m3u_lines), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/live/<cid>.m3u8')
-def playlist_handler(cid):
-    clean_cid = cid.split('.')[0]
-    info = omega.resolve_stream(clean_cid)
+def playlist_wrapper(cid):
+    """
+    Kanal M3U8 dosyasini isler, TS ve KEY linklerini bizim proxy'ye yonlendirir.
+    """
+    info = find_working_stream(cid)
     
-    if not info: 
-        return Response("Not Found", 404)
-
-    host_b = request.host_url.rstrip('/').encode()
-    cid_b = clean_cid.encode()
+    if not info:
+        return Response("Stream Offline", 404)
     
-    out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
+    base_url = info['base_url']
+    host = request.host_url.rstrip('/')
     
-    for line in info['content'].split(b'\n'):
+    # Icerigi satir satir işle
+    content = info['content'].decode('utf-8', errors='ignore')
+    new_lines = []
+    
+    for line in content.splitlines():
         line = line.strip()
-        if not line: 
+        if not line:
             continue
-        
-        if line.startswith(b'#'):
-            if b"EXT-X-KEY" in line:
-                key_line = line.decode('utf-8', errors='ignore')
-                if 'URI="' in key_line:
-                    uri_match = re.search(r'URI="([^"]+)"', key_line)
-                    if uri_match:
-                        key_url = uri_match.group(1)
-                        
-                        # --- FIXED: Full URL path protection ---
-                        # Key URL'ini bozmadan (query hariç) olduğu gibi alıyoruz
-                        # Proxy bu path'i urljoin ile birleştirecek.
-                        clean_key_path = key_url.split('?')[0]
-                        
-                        proxy_key_url = f'{request.host_url.rstrip("/")}/key?cid={clean_cid}&url={quote(clean_key_path)}'
-                        key_line = re.sub(r'URI="[^"]+"', f'URI="{proxy_key_url}"', key_line)
-                        out.append(key_line.encode())
-                        continue
-                out.append(line)
-                continue
             
-            if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
-                out.append(line)
+        if line.startswith("#"):
+            # Sifreleme Anahtari (KEY) varsa yakala
+            if "EXT-X-KEY" in line:
+                # URI="..." kismini regex ile bul
+                def key_replacer(match):
+                    original_key = match.group(1)
+                    # Absolute URL yap
+                    full_key_url = urljoin(base_url + "/", original_key)
+                    # Proxy URL'e cevir
+                    return f'URI="{host}/proxy?url={quote(full_key_url)}"'
+                
+                line = re.sub(r'URI="([^"]+)"', key_replacer, line)
+            new_lines.append(line)
         else:
-            line_str = line.decode('utf-8', errors='ignore')
-            # TS dosyasını da query string'den arındır
-            filename = line_str.split('?')[0]
+            # TS Dosyasi (Video Segmenti)
+            # URL'i tam hale getir
+            full_ts_url = urljoin(base_url + "/", line)
+            # Proxy URL'e cevir
+            new_lines.append(f"{host}/proxy?url={quote(full_ts_url)}")
             
-            safe_target = quote(filename).encode()
-            out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
-            
-    return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
+    return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
 
-@app.route('/ts')
-def segment_handler():
-    filename_enc = request.args.get('url')
-    cid = request.args.get('cid')
+@app.route('/proxy')
+def unified_proxy():
+    """
+    Tek Merkezli Proxy: TS ve KEY dosyalarini indirir.
+    """
+    target = request.args.get('url')
+    if not target:
+        return Response("Missing URL", 400)
     
-    if not filename_enc or not cid: 
-        return Response("Bad Request", 400)
+    real_url = unquote(target)
     
-    filename = unquote(filename_enc)
+    # Icerik tipini tahmin et (ts icin video, key icin octet)
+    c_type = "video/mp2t" if ".ts" in real_url else "application/octet-stream"
+    
     return Response(
-        stream_with_context(raid_downloader(filename, cid)), 
-        content_type="video/mp2t"
+        stream_with_context(stream_proxy(real_url)),
+        content_type=c_type
     )
 
-@app.route('/key')
-def key_handler():
-    """Şifreleme anahtarı proxy (FIXED URL JOIN)"""
-    filename_enc = request.args.get('url')
-    cid = request.args.get('cid')
-    
-    if not filename_enc or not cid: 
-        return Response("Bad Request", 400)
-    
-    # URL encoded string'i çöz
-    filename = unquote(filename_enc)
-    
-    info = omega.resolve_stream(cid)
-    if not info: 
-        return Response("Not Found", 404)
-    
-    # --- FIXED: urljoin kullanımı ---
-    # filename relative (../keys/a.key) veya absolute (http://...) olabilir
-    # urljoin bunu otomatik handle eder.
-    key_url = urljoin(info['final_url'], filename)
-    
-    try:
-        h = get_headers(key_url)
-        r = safe_request(key_url, headers=h, verify=False, timeout=5)
-        
-        if r.status_code == 200:
-            return Response(r.content, content_type="application/octet-stream")
-        else:
-            if DEBUG_MODE:
-                print(f"[KEY ERROR] Status {r.status_code}: {key_url}")
-            return Response("Key Not Found", 404)
-            
-    except Exception as e:
-        if DEBUG_MODE: 
-            print(f"[KEY ERROR] {e}")
-        return Response("Key Error", 500)
+@app.route('/status')
+def status_check():
+    """Sunucu durumunu kontrol etmek icin basit sayfa"""
+    return "Vavoo Proxy is Running! OK."
 
 # ------------------------------------------------------------------------------
-# HEALTH CHECK
+# BASLATMA (MAIN)
 # ------------------------------------------------------------------------------
-@app.route('/health')
-def health_check():
-    status = {
-        'status': 'ok',
-        'sources': {src: omega.health[src] for src in SOURCES},
-        'cache_size': len(omega.channel_map.cache),
-        'active_threads': len(pool.Group()) if 'pool' in globals() else 'N/A'
-    }
-    return Response(str(status), content_type="text/plain")
-
-# ------------------------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------------------------
-def signal_handler(signum, frame):
-    print(f"\n[SHUTDOWN] Signal {signum}")
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
-
 if __name__ == "__main__":
-    print("=" * 70)
-    print(" ► VAVOO SINGULARITY: OMEGA (PRODUCTION READY - PATCHED)")
-    print(" ► FIXES:")
-    print("   • Thread-safe session management")
-    print("   • Key URL path resolution (Deep link fix)")
-    print("   • Fallback null-pointer protection")
-    print("   • Race condition eliminated")
-    print("   • Timeout optimizations")
-    print(" ► LISTENING: 0.0.0.0:8080")
-    print("=" * 70)
+    print("\n" + "="*60)
+    print(" ► VAVOO PROXY TAM SURUM (FINAL)")
+    print(" ► PORT: 8080")
+    print(" ► URL: http://localhost:8080")
+    print(" ► DURDURMAK ICIN: CTRL+C")
+    print("="*60 + "\n")
     
-    server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
+    # WSGI Server: Coklu baglanti destegi icin Gevent kullaniyoruz
+    http_server = WSGIServer(('0.0.0.0', 8080), app, log=None)
     try:
-        server.serve_forever()
+        http_server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Graceful exit")
+        print("\nKapatiliyor...")
+        sys.exit(0)
