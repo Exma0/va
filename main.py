@@ -1,9 +1,3 @@
-# ==============================================================================
-# VAVOO SINGULARITY - ETERNAL EDITION
-# Tech: RAID-1 Mirroring | Predictive Future-Fetch | Zero-Latency Core
-# Status: ETERNAL (Ölümsüz Yayın)
-# ==============================================================================
-
 from gevent import monkey
 monkey.patch_all()
 
