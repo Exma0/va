@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO PROXY - TITAN V3 (PREDATOR EDITION)
-# Tech: Reinforcement Learning | Real-Time Flow Analysis | Proactive Caching
-# Status: PRE-COGNITIVE (Kullanıcıdan Önce Düşünen Sistem)
+# VAVOO PROXY - TITAN V3 (HYPERSPEED EDITION)
+# Tech: Low-Level Socket Streaming | Async Learning | Zero-Latency Loop
+# Status: OPTIMIZED (Maksimum Hız)
 # ==============================================================================
 
 from gevent import monkey
@@ -11,15 +11,14 @@ import time
 import requests
 import urllib3
 import gc
-import math
 import random
-from gevent import pool, event, spawn, sleep, lock
+from gevent import pool, event, spawn, lock
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
 
 # ------------------------------------------------------------------------------
-# 1. SİSTEM AYARLARI & BELLEK YÖNETİMİ
+# 1. SİSTEM AYARLARI
 # ------------------------------------------------------------------------------
 gc.set_threshold(100000, 50, 50)
 
@@ -30,27 +29,38 @@ SOURCES = [
     "https://kool.to"
 ]
 
-# Donma Tespiti İçin Eşik Değeri (Byte/Saniye)
-MIN_FREEZE_THRESHOLD = 300 * 1024 
-
+# Urllib3 Uyarılarını Kapat
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 app = Flask(__name__)
+# Logları tamamen kapat (Hız için kritik)
 import logging
-logging.getLogger('werkzeug').disabled = True
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 app.logger.disabled = True
 
 # ------------------------------------------------------------------------------
-# 2. NETWORK KATMANI (SESSION POOL)
+# 2. HIZLI NETWORK HAVUZU (RAW SOCKET POOL)
 # ------------------------------------------------------------------------------
+# Requests Session (Sadece Playlist ve API için)
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=2000,
-    pool_maxsize=20000,
+    pool_connections=1000,
+    pool_maxsize=10000,
     max_retries=0,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
+# RAW Pool Manager (Video Akışı İçin - Requests'ten çok daha hızlıdır)
+http_pool = urllib3.PoolManager(
+    num_pools=1000,
+    maxsize=10000,
+    block=False,
+    retries=False,
+    timeout=urllib3.Timeout(connect=2.0, read=7.0)
+)
 
 HEADERS_MEM = {}
 def get_headers(base_url):
@@ -58,236 +68,124 @@ def get_headers(base_url):
         HEADERS_MEM[base_url] = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": f"{base_url}/",
-            "Origin": base_url,
             "Connection": "keep-alive"
         }
     return HEADERS_MEM[base_url]
 
 # ------------------------------------------------------------------------------
-# 3. NEURAL BRAIN (ÖĞRENEN BEYİN)
+# 3. LIGHTWEIGHT NEURAL BRAIN (HAFİFLETİLMİŞ BEYİN)
 # ------------------------------------------------------------------------------
 class NeuralBrain:
     def __init__(self):
-        self.weights = {src: 1.0 for src in SOURCES}
-        self.instability = {src: 0.0 for src in SOURCES}
+        self.weights = {src: 5.0 for src in SOURCES} # 0.1 - 10.0 arası
         self.cache = {} 
-        self.lock = lock.RLock()
+        self.lock = lock.RLock() # Thread safe lock
+        
+        # Unutma faktörü (Memory Decay)
         spawn(self._memory_decay)
 
     def _memory_decay(self):
         while True:
-            sleep(10)
-            with self.lock:
-                for src in SOURCES:
-                    if self.weights[src] > 1.0: self.weights[src] *= 0.98
-                    if self.weights[src] < 1.0: self.weights[src] *= 1.02
-                    self.instability[src] *= 0.9
+            time.sleep(15)
+            # Kilit (Lock) kullanmadan yaklaşık değerlerle işlem yap (Hız için)
+            for src in SOURCES:
+                if self.weights[src] > 5.0: self.weights[src] *= 0.99
+                if self.weights[src] < 5.0: self.weights[src] *= 1.01
 
-    def train(self, source, speed_bps, success=True):
+    def train_async(self, source, success):
+        """Eğitimi ana akışı bloklamadan arka planda yap"""
+        spawn(self._train_worker, source, success)
+
+    def _train_worker(self, source, success):
         with self.lock:
-            if not success:
-                self.weights[source] *= 0.5 
-                self.instability[source] += 10.0
+            if success:
+                self.weights[source] = min(10.0, self.weights[source] * 1.05)
             else:
-                reward = 1.1 if speed_bps > 1000000 else 1.01
-                self.weights[source] *= reward
-                self.instability[source] = max(0, self.instability[source] - 0.5)
-            self.weights[source] = max(0.1, min(10.0, self.weights[source]))
+                self.weights[source] = max(0.1, self.weights[source] * 0.5)
 
     def predict_best_source(self):
-        total_weight = sum(self.weights.values())
-        if total_weight == 0: return SOURCES[0]
-        pick = random.uniform(0, total_weight)
-        current = 0
-        for src, weight in self.weights.items():
-            current += weight
-            if current > pick:
-                return src
+        """En iyi kaynağı seçer (Hızlı versiyon)"""
+        # Hız için kopyalama yapmadan işlem yapmaya çalışıyoruz
+        try:
+            total = sum(self.weights.values())
+            pick = random.uniform(0, total)
+            current = 0
+            for src, weight in self.weights.items():
+                current += weight
+                if current > pick: return src
+        except: pass
         return SOURCES[0]
 
-    def resolve_playlist(self, cid, force_fresh=False):
-        """Playlist bulur ve önbellekler."""
+    def resolve_playlist(self, cid):
         now = time.time()
-        cid = cid.replace('.m3u8', '')
+        cid_clean = cid.replace('.m3u8', '')
         
-        # Cache kontrolü (force_fresh False ise)
-        if not force_fresh and cid in self.cache:
-            entry = self.cache[cid]
+        # Cache Check
+        if cid_clean in self.cache:
+            entry = self.cache[cid_clean]
             if now < entry['expires']: return entry['data']
 
-        # Neural Tahmin ile Kaynak Seç (Yarış modunda en iyi 2 kaynağı seçer)
         primary = self.predict_best_source()
-        # İkinci en iyi kaynağı bul
-        backup = sorted(SOURCES, key=lambda s: self.weights[s], reverse=True)[1]
         
-        # Eğer force_fresh (Arkaplan taraması) ise, DAHA FAZLA kaynak dene (Max 3)
-        if force_fresh:
-            candidates = [primary, backup, SOURCES[random.randint(0, len(SOURCES)-1)]]
-            candidates = list(set(candidates)) # Tekrar edenleri sil
-        else:
-            candidates = [primary, backup] if primary != backup else [primary]
-        
-        result_box = event.AsyncResult()
-        
-        def worker(src):
-            try:
-                url = f"{src}/play/{cid}/index.m3u8"
-                h = get_headers(src)
-                t0 = time.time()
-                # Timeout'u kısa tut ki hızlı olan kazansın
-                with session.get(url, headers=h, verify=False, timeout=2.0) as r:
-                    if r.status_code == 200:
-                        elapsed = time.time() - t0
-                        bps = len(r.content) / elapsed
-                        self.train(src, bps, True)
-                        
-                        if not result_box.ready():
-                            result_box.set({
-                                'content': r.content,
-                                'base': r.url.rsplit('/', 1)[0],
-                                'headers': h,
-                                'source': src
-                            })
-                    else:
-                        self.train(src, 0, False)
-            except:
-                self.train(src, 0, False)
-
-        pool_ = pool.Pool(len(candidates))
-        for src in candidates:
-            pool_.spawn(worker, src)
-        
+        # Tek işçi ile hızlı deneme (Parallel overhead'inden kaçınmak için önce en iyiyi dene)
         try:
-            # İlk gelen cevabı al (Yarışın kazananı)
-            winner = result_box.get(timeout=2.5)
-            pool_.kill(block=False)
-            if winner:
-                # Cache süresini 5 dakika yap
-                self.cache[cid] = {'expires': now + 300, 'data': winner}
-                return winner
+            res = self._fetch_playlist(primary, cid_clean)
+            if res: 
+                self.cache[cid_clean] = {'expires': now + 300, 'data': res}
+                self.train_async(primary, True)
+                return res
         except:
-            pool_.kill(block=False)
+            self.train_async(primary, False)
+
+        # Eğer favori başarısızsa, diğerlerini dene
+        for src in SOURCES:
+            if src == primary: continue
+            try:
+                res = self._fetch_playlist(src, cid_clean)
+                if res:
+                    self.cache[cid_clean] = {'expires': now + 300, 'data': res}
+                    self.train_async(src, True)
+                    return res
+            except: pass
+            
+        return None
+
+    def _fetch_playlist(self, src, cid):
+        url = f"{src}/play/{cid}/index.m3u8"
+        h = get_headers(src)
+        with session.get(url, headers=h, verify=False, timeout=2.0) as r:
+            if r.status_code == 200:
+                return {
+                    'content': r.content,
+                    'base': r.url.rsplit('/', 1)[0],
+                    'source': src
+                }
         return None
 
 brain = NeuralBrain()
 
 # ------------------------------------------------------------------------------
-# 4. BACKGROUND OPTIMIZER (YENİ ÖZELLİK)
-# ------------------------------------------------------------------------------
-class BackgroundOptimizer:
-    """Sistem boştayken kanalları tarar ve en hızlı CDN'i cache'e atar."""
-    def __init__(self):
-        self.scanning = True
-        spawn(self._run_loop)
-
-    def _get_channel_list(self):
-        # Kanal listesini almak için en iyi kaynağı dener
-        for src in SOURCES:
-            try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=3)
-                if r.status_code == 200: return r.json()
-            except: continue
-        return []
-
-    def _run_loop(self):
-        print(" ► BRAIN: Background Optimizer Engine Started [IDLE MODE]")
-        while self.scanning:
-            try:
-                data = self._get_channel_list()
-                if not data:
-                    sleep(10)
-                    continue
-
-                # Sadece Turkey grubu (Performans için)
-                turkey_channels = [
-                    item['url'].split('/play/')[-1].split('/')[0].replace('.m3u8', '') 
-                    for item in data if item.get("group") == "Turkey"
-                ]
-
-                total = len(turkey_channels)
-                print(f" ► BRAIN: Analyzing {total} channels for optimal routes...")
-
-                # 5'li gruplar halinde tara (Sunucuyu boğmamak için)
-                p = pool.Pool(5) 
-                
-                for i, cid in enumerate(turkey_channels):
-                    # Zaten cache'de varsa ve yeniyse atla
-                    if cid in brain.cache:
-                        if time.time() < brain.cache[cid]['expires'] - 60:
-                            continue
-
-                    p.spawn(brain.resolve_playlist, cid, True)
-                    
-                    # Her 10 kanalda bir kısa mola ver (CPU'yu rahatlat)
-                    if i % 10 == 0: sleep(0.1)
-                
-                p.join()
-                print(" ► BRAIN: Optimization cycle finished. Cache hot & ready.")
-                
-            except Exception as e:
-                print(f" ► BRAIN ERROR: {e}")
-            
-            # Bir sonraki tam tarama döngüsü için bekle (örn: 3 dakika)
-            sleep(180)
-
-# Optimizer'ı başlat
-optimizer = BackgroundOptimizer()
-
-# ------------------------------------------------------------------------------
-# 5. STREAM HEALTH MONITOR
-# ------------------------------------------------------------------------------
-class StreamHealthMonitor:
-    def __init__(self, source):
-        self.source = source
-        self.start_time = time.time()
-        self.bytes_transferred = 0
-        self.last_check = time.time()
-        self.last_bytes = 0
-
-    def update(self, chunk_len):
-        self.bytes_transferred += chunk_len
-        
-    def check_health(self):
-        now = time.time()
-        delta = now - self.last_check
-        
-        if delta >= 1.0:
-            bytes_diff = self.bytes_transferred - self.last_bytes
-            speed_bps = bytes_diff / delta
-            
-            self.last_check = now
-            self.last_bytes = self.bytes_transferred
-            
-            brain.train(self.source, speed_bps, True)
-            
-            if speed_bps < MIN_FREEZE_THRESHOLD:
-                brain.train(self.source, speed_bps, False)
-                return False 
-                
-        return True
-
-# ------------------------------------------------------------------------------
-# 6. ENDPOINTS
+# 4. ENDPOINTS
 # ------------------------------------------------------------------------------
 
 @app.route('/')
 def root():
-    # Cache'den veya en hızlı kaynaktan listeyi al
-    best_src = sorted(SOURCES, key=lambda s: brain.weights[s], reverse=True)[0]
+    # En basit haliyle listeyi çek
+    best_src = brain.predict_best_source()
     data = None
     
-    # Hızlıca en iyiyi dene
+    # Önce en iyi kaynaktan dene
     try:
-        r = session.get(f"{best_src}/live2/index", verify=False, timeout=2)
+        r = session.get(f"{best_src}/live2/index", verify=False, timeout=3)
         if r.status_code == 200: data = r.json()
     except: pass
     
-    # Olmazsa diğerlerini dene
+    # Olmazsa yedeklerden biri
     if not data:
         for src in SOURCES:
             if src == best_src: continue
             try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=2)
+                r = session.get(f"{src}/live2/index", verify=False, timeout=3)
                 if r.status_code == 200: 
                     data = r.json()
                     break
@@ -298,25 +196,25 @@ def root():
     host_b = request.host_url.rstrip('/').encode()
     out = [b"#EXTM3U"]
     
+    # String birleştirme maliyetini azaltmak için list append kullanıyoruz
     for item in data:
         if item.get("group") == "Turkey":
             try:
+                # String işlemleri CPU yorar, minimuma indirildi
                 u = item['url']
-                part = u.split('/play/')[-1]
-                cid = part.split('/')[0].replace('.m3u8', '').split('.')[0]
+                # Hızlı split
+                cid = u.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                 
-                if cid:
-                    name = item['name'].replace(',', ' ')
-                    out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
-                    out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
+                name = item['name'].replace(',', ' ')
+                out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
+                out.append(host_b + b'/live/' + cid.encode() + b'.m3u8')
             except: pass
 
     return Response(b"\n".join(out), content_type="application/x-mpegURL")
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    # force_fresh=False -> Normal kullanıcı isteği, önce cache'e bakar
-    info = brain.resolve_playlist(cid, force_fresh=False)
+    info = brain.resolve_playlist(cid)
     if not info: return Response("Not Found", 404)
 
     base_b = info['base'].encode()
@@ -325,18 +223,24 @@ def playlist_handler(cid):
     
     out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
     
-    for line in info['content'].split(b'\n'):
+    # Byte işlemi yaparak string decode/encode maliyetinden kaçıyoruz
+    lines = info['content'].split(b'\n')
+    for line in lines:
         line = line.strip()
         if not line: continue
         
-        if line.startswith(b'#'):
+        if line[0] == 35: # b'#' karakterinin ASCII kodu 35
             if b"EXT-X-KEY" in line: continue
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
         else:
-            if line.startswith(b'http'): target = line
-            else: target = base_b + b'/' + line
+            # Segment URL oluşturma
+            if line.startswith(b'http'): 
+                target = line
+            else: 
+                target = base_b + b'/' + line
             
+            # URL encode işlemini sadece target için yap
             safe_target = quote(target).encode()
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
@@ -344,64 +248,51 @@ def playlist_handler(cid):
 
 @app.route('/ts')
 def segment_handler():
-    url_enc = request.args.get('url')
-    cid = request.args.get('cid')
+    # Argument parsing'i hızlandır
+    args = request.args
+    url_enc = args.get('url')
     if not url_enc: return "Bad", 400
     
     target = unquote(url_enc)
-    origin = "https://vavoo.to"
-    current_source = "https://vavoo.to"
-    try:
-        temp = target.split('/', 3)
-        origin = f"{temp[0]}//{temp[2]}"
-        for s in SOURCES:
-            if s in origin:
-                current_source = s
-                break
-    except: pass
     
-    h = get_headers(origin)
+    # Basit kaynak tespiti
+    current_source = "https://vavoo.to"
+    for s in SOURCES:
+        if s in target:
+            current_source = s
+            break
+            
+    h = get_headers(current_source)
 
-    def smart_stream():
-        monitor = StreamHealthMonitor(current_source)
+    def fast_stream():
         try:
-            with session.get(target, headers=h, verify=False, stream=True, timeout=(2, 6)) as r:
-                if r.status_code == 200:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        if chunk:
-                            try:
-                                yield chunk
-                                monitor.update(len(chunk))
-                                if not monitor.check_health():
-                                    raise Exception("Slow Stream Detected")
-                            except (OSError, IOError):
-                                return
-                else:
-                    raise Exception("Bad Status Code")
-                    
-        except Exception as e:
-            if cid and str(e) != "GeneratorExit":
-                brain.train(current_source, 0, False)
-                # Cache sil ki bir sonraki istekte en iyi kaynak tekrar aransın
-                if cid in brain.cache: del brain.cache[cid]
-                
-                # FALLBACK MEKANİZMASI (Anlık Kurtarma)
-                new_info = brain.resolve_playlist(cid, force_fresh=True)
-                if new_info and new_info['source'] != current_source:
-                    fname = target.rsplit('/', 1)[-1].split('?')[0]
-                    new_target = f"{new_info['base']}/{fname}"
-                    try:
-                        h2 = get_headers(new_info['source'])
-                        with session.get(new_target, headers=h2, verify=False, stream=True, timeout=5) as r2:
-                            if r2.status_code == 200:
-                                for chunk in r2.iter_content(chunk_size=65536):
-                                    yield chunk
-                    except: pass
+            # Requests yerine URLLIB3 kullanıyoruz (Daha Hızlı)
+            # preload_content=False ile hafızaya almadan stream eder
+            r = http_pool.request('GET', target, headers=h, preload_content=False)
+            
+            if r.status == 200:
+                brain.train_async(current_source, True)
+                # Tampon boyutunu artırdık: 128KB (Daha az döngü = Daha az CPU)
+                # stream() metodu generator döner
+                for chunk in r.stream(131072):
+                    yield chunk
+                r.release_conn()
+            else:
+                r.release_conn()
+                brain.train_async(current_source, False)
+                # Hata durumunda (403/404/500) boş dön, client retry yapsın
+                # Proxy'nin retry yapması canlı yayında gecikme yaratır.
+                return 
 
-    return Response(stream_with_context(smart_stream()), content_type="video/mp2t")
+        except Exception:
+            brain.train_async(current_source, False)
+            return
+
+    return Response(stream_with_context(fast_stream()), content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► TITAN V3 - PREDATOR EDITION")
-    print(f" ► AI: Active | PRE-COGNITIVE CACHE: Active")
+    print(f" ► TITAN V3 - HYPERSPEED EDITION")
+    print(f" ► MODE: Raw Socket Streaming")
+    # Log: None (Maksimum performans)
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
