@@ -8,6 +8,7 @@ from gevent import pool
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 from urllib.parse import quote, unquote
+from collections import OrderedDict # RAM Cache yönetimi için eklendi
 
 try:
     import ujson as json
@@ -20,6 +21,12 @@ SOURCES = [
 
 USER_AGENT = "VAVOO/3.1.20"
 PORT = 8080
+
+# --- RAM AYARLARI ---
+# Hafızada kaç adet .ts dosyası tutulacak? 
+# Ortalama 1 ts dosyası 1-2 MB'dır. 1000 dosya yaklaşık 1GB - 2GB RAM yer.
+MAX_CACHE_ITEMS = 500 
+TS_CACHE = OrderedDict()
 
 gc.set_threshold(700, 10, 10)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -67,13 +74,42 @@ def fetch_playlist_content(cid):
             continue
     return None, None, None
 
+# Hem anlık gönderen hem de RAM'e yazan fonksiyon
+def stream_and_cache_generator(r, cache_key):
+    data_buffer = bytearray()
+    try:
+        # Chunk boyutu 8KB yapıldı, hızlı aktarım için
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                data_buffer.extend(chunk) # Hafızaya ekle
+                yield chunk # Kullanıcıya gönder
+        
+        # Akış başarıyla biterse Cache'e kaydet
+        if len(TS_CACHE) >= MAX_CACHE_ITEMS:
+            TS_CACHE.popitem(last=False) # En eskiyi sil
+        
+        TS_CACHE[cache_key] = bytes(data_buffer) # Byte'a çevirip sakla
+        
+    except Exception as e:
+        # Hata olursa cache'e yarım dosya kaydetme
+        pass
+    finally:
+        r.close()
+
 def proxy_stream(url, timeout_settings):
+    # Önce RAM kontrolü
+    if url in TS_CACHE:
+        return Response(TS_CACHE[url], content_type="video/mp2t")
+
     try:
         r = session.get(url, stream=True, verify=False, timeout=timeout_settings)
-        return Response(stream_with_context(r.iter_content(chunk_size=None)), 
-                        content_type="video/mp2t")
+        if r.status_code == 200:
+            return Response(stream_with_context(stream_and_cache_generator(r, url)), 
+                          content_type="video/mp2t")
+        r.close()
     except:
-        return Response("Error", 502)
+        pass
+    return Response("Error", 502)
 
 @app.route('/')
 def root():
@@ -131,7 +167,14 @@ def segment_handler():
     if not url_enc: return "Bad Request", 400
     
     original_target = unquote(url_enc)
-    TIMEOUT_SETTINGS = (None, None)
+    
+    # 1. ADIM: RAM KONTROLÜ
+    # Eğer bu dosya daha önce indirilmişse RAM'den ver ve çık.
+    if original_target in TS_CACHE:
+        # Cache hit - direkt hafızadan gönder
+        return Response(TS_CACHE[original_target], content_type="video/mp2t")
+
+    TIMEOUT_SETTINGS = (3, 10) # Connect timeout 3, Read timeout 10
 
     path_part = None
     target_domain = None
@@ -146,24 +189,31 @@ def segment_handler():
     if not target_domain:
         return proxy_stream(original_target, TIMEOUT_SETTINGS)
 
+    # 2. ADIM: İLK DENEME (Kaynak Site)
     try:
         r = session.get(original_target, stream=True, verify=False, timeout=TIMEOUT_SETTINGS)
         if r.status_code == 200:
-            return Response(stream_with_context(r.iter_content(chunk_size=None)), 
+            # Hem stream et hem cache'e yaz
+            return Response(stream_with_context(stream_and_cache_generator(r, original_target)), 
                           content_type="video/mp2t")
         r.close()
     except:
         pass 
         
+    # 3. ADIM: YEDEK KAYNAKLAR (Failover)
     if path_part:
         for src in SOURCES:
             if src == target_domain: continue
             
             new_target = src + path_part
+            # Yedek kaynak için de cache kontrolü yapalım mı? 
+            # Genelde URL farklı olduğu için gerekmez ama new_target ile kontrol edilebilir.
+            
             try:
                 r = session.get(new_target, stream=True, verify=False, timeout=TIMEOUT_SETTINGS)
                 if r.status_code == 200:
-                    return Response(stream_with_context(r.iter_content(chunk_size=None)), 
+                    # Başarılı kaynağı stream et ve cache'e (orijinal url anahtarıyla değil yeni url ile) yaz
+                    return Response(stream_with_context(stream_and_cache_generator(r, original_target)), 
                                   content_type="video/mp2t")
                 r.close()
             except:
@@ -172,9 +222,12 @@ def segment_handler():
     return Response("Source Error", 502)
 
 if __name__ == "__main__":
+    # Worker sayısını RAM kullanımına göre dikkatli ayarla
     worker_pool = pool.Pool(1000)
     server = WSGIServer(('0.0.0.0', PORT), app, spawn=worker_pool, log=None)
     try:
+        print(f"Server baslatildi: Port {PORT}")
+        print(f"RAM Cache limiti: {MAX_CACHE_ITEMS} segment")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
