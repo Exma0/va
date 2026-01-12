@@ -1,7 +1,7 @@
 # ==============================================================================
-# VAVOO PROXY - TITANIUM EDITION (FULL COMPATIBLE)
-# Architecture: Redirect Aware | Token Regenerator | Absolute/Relative Path Handler
-# Status: FINAL STABLE
+# VAVOO PROXY - TITAN V2 (NEURAL EDITION)
+# Tech: Reinforcement Learning | Real-Time Flow Analysis | Auto-Optimization
+# Status: SELF-AWARE (Kendi Kendini Yöneten)
 # ==============================================================================
 
 from gevent import monkey
@@ -11,17 +11,16 @@ import time
 import requests
 import urllib3
 import gc
-import sys
-import re
-from gevent import pool, event, spawn, sleep, lock, queue, killall
+import math
+import random
+from gevent import pool, event, spawn, sleep, lock
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import quote, unquote
 
 # ------------------------------------------------------------------------------
-# 1. SİSTEM AYARLARI
+# 1. SİSTEM AYARLARI & BELLEK YÖNETİMİ
 # ------------------------------------------------------------------------------
-sys.setswitchinterval(0.001)
 gc.set_threshold(100000, 50, 50)
 
 SOURCES = [
@@ -31,8 +30,9 @@ SOURCES = [
     "https://kool.to"
 ]
 
-# Video dosyası (TS) en az 1KB olmalı (Boş paket koruması)
-MIN_TS_SIZE = 1024 
+# Donma Tespiti İçin Eşik Değeri (Byte/Saniye)
+# 300KB/s altı = Yüksek Bitrate yayında donma riski
+MIN_FREEZE_THRESHOLD = 300 * 1024 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
@@ -42,156 +42,195 @@ logging.getLogger('werkzeug').disabled = True
 app.logger.disabled = True
 
 # ------------------------------------------------------------------------------
-# 2. NETWORK KATMANI
+# 2. NETWORK KATMANI (SESSION POOL)
 # ------------------------------------------------------------------------------
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=2000,
-    pool_maxsize=10000,
-    max_retries=1,
+    pool_maxsize=20000,
+    max_retries=0,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# Header Fabrikası (Dinamik Referer)
-def get_headers(target_url):
-    """
-    Vavoo sunucuları Referer kontrolü yapar.
-    İstek attığımız URL'in domaini neyse, Referer o olmalıdır.
-    """
-    parsed = urlparse(target_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": f"{origin}/",
-        "Origin": origin,
-        "Connection": "keep-alive"
-    }
+HEADERS_MEM = {}
+def get_headers(base_url):
+    if base_url not in HEADERS_MEM:
+        HEADERS_MEM[base_url] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": f"{base_url}/",
+            "Origin": base_url,
+            "Connection": "keep-alive"
+        }
+    return HEADERS_MEM[base_url]
 
 # ------------------------------------------------------------------------------
-# 3. VAVOO CORE LOGIC
+# 3. NEURAL BRAIN (ÖĞRENEN BEYİN)
 # ------------------------------------------------------------------------------
-class VavooCore:
+class NeuralBrain:
     def __init__(self):
-        self.channel_cache = {} # {cid: {final_url, source, expires}}
-        self.list_cache = None
-        self.list_expires = 0
+        # Nöral Ağırlıklar (Başlangıçta hepsi eşit: 1.0)
+        self.weights = {src: 1.0 for src in SOURCES}
+        
+        # Stabilite Skoru (Ceza puanı, 0 = Mükemmel)
+        self.instability = {src: 0.0 for src in SOURCES}
+        
+        self.cache = {} 
         self.lock = lock.RLock()
-
-    def get_channel_list(self):
-        """Kanal listesini çeker ve 10 dakika önbellekler."""
-        now = time.time()
-        if self.list_cache and now < self.list_expires:
-            return self.list_cache
-
-        # Kaynakları sırayla dene
-        for src in SOURCES:
-            try:
-                r = session.get(f"{src}/live2/index", verify=False, timeout=4)
-                if r.status_code == 200:
-                    data = r.json()
-                    self.list_cache = data
-                    self.list_expires = now + 600 # 10 dakika
-                    return data
-            except: continue
-        return []
-
-    def resolve_stream_url(self, cid):
-        """
-        Kanalın gerçek ve güncel (imzalı) URL'ini bulur.
-        Redirectleri takip eder.
-        """
-        now = time.time()
         
-        # Cache kontrolü
-        if cid in self.channel_cache:
-            entry = self.channel_cache[cid]
-            if now < entry['expires']: return entry
+        # Arka planda unutma faktörü (Eski hataları zamanla affet)
+        spawn(self._memory_decay)
 
-        # Kaynakları tara
-        for src in SOURCES:
-            # Vavoo yapısı: /play/<id>/index.m3u8
-            initial_url = f"{src}/play/{cid}/index.m3u8"
-            
-            try:
-                # allow_redirects=True ÖNEMLİDİR.
-                # Vavoo bizi huhu.to'dan -> cdn.server.com'a atar.
-                h = get_headers(initial_url)
-                r = session.get(initial_url, headers=h, verify=False, timeout=4, allow_redirects=True)
-                
-                if r.status_code == 200:
-                    # Playlist Validasyonu
-                    if b"#EXTM3U" not in r.content:
-                        continue
+    def _memory_decay(self):
+        """Zamanla eski verilerin etkisini azaltır (Adaptasyon)."""
+        while True:
+            sleep(10)
+            with self.lock:
+                for src in SOURCES:
+                    # Ağırlıkları merkeze (1.0) çek
+                    if self.weights[src] > 1.0: self.weights[src] *= 0.98
+                    if self.weights[src] < 1.0: self.weights[src] *= 1.02
+                    # Cezaları azalt
+                    self.instability[src] *= 0.9
 
-                    final_url = r.url # Redirect sonrası son adres (Tokenlı)
-                    
-                    result = {
-                        'final_url': final_url,
-                        'source_root': src, # Orijinal kaynak
-                        'content': r.content,
-                        'expires': now + 300 # 5 dakika geçerli token
-                    }
-                    self.channel_cache[cid] = result
-                    return result
-            except: continue
+    def train(self, source, speed_bps, success=True):
+        """
+        Reinforcement Learning (Ödül/Ceza Sistemi)
+        """
+        with self.lock:
+            if not success:
+                # Ağır Ceza
+                self.weights[source] *= 0.5 
+                self.instability[source] += 10.0
+            else:
+                # Hıza göre Ödül
+                # 1MB/s üstü = Büyük ödül, Altı = Küçük ödül
+                reward = 1.1 if speed_bps > 1000000 else 1.01
+                self.weights[source] *= reward
+                # Stabiliteyi artır
+                self.instability[source] = max(0, self.instability[source] - 0.5)
+
+            # Sınırlandırma (Aşırı uç değerleri engelle)
+            self.weights[source] = max(0.1, min(10.0, self.weights[source]))
+
+    def predict_best_source(self):
+        """
+        Mevcut verilere göre en iyi kaynağı seçer.
+        Sadece en yüksek puanlıyı değil, puanı yüksek olanlar arasından
+        olasılıksal seçim yapar (Exploration vs Exploitation).
+        """
+        total_weight = sum(self.weights.values())
+        if total_weight == 0: return SOURCES[0]
         
+        # Roulette Wheel Selection
+        pick = random.uniform(0, total_weight)
+        current = 0
+        for src, weight in self.weights.items():
+            current += weight
+            if current > pick:
+                return src
+        return SOURCES[0]
+
+    def resolve_playlist(self, cid):
+        """Playlist bulur ve önbellekler."""
+        now = time.time()
+        cid = cid.replace('.m3u8', '')
+        
+        if cid in self.cache:
+            entry = self.cache[cid]
+            if now < entry['expires']: return entry['data']
+
+        # Neural Tahmin ile Kaynak Seç
+        primary = self.predict_best_source()
+        # Yedek olarak en yüksek 2. puanlıyı al
+        backup = sorted(SOURCES, key=lambda s: self.weights[s], reverse=True)[1]
+        
+        candidates = [primary, backup] if primary != backup else [primary]
+        
+        result_box = event.AsyncResult()
+        
+        def worker(src):
+            try:
+                url = f"{src}/play/{cid}/index.m3u8"
+                h = get_headers(src)
+                t0 = time.time()
+                with session.get(url, headers=h, verify=False, timeout=2.5) as r:
+                    if r.status_code == 200:
+                        elapsed = time.time() - t0
+                        # Basit bir hız tahmini (Playlist küçük olduğu için)
+                        bps = len(r.content) / elapsed
+                        self.train(src, bps, True)
+                        
+                        if not result_box.ready():
+                            result_box.set({
+                                'content': r.content,
+                                'base': r.url.rsplit('/', 1)[0],
+                                'headers': h,
+                                'source': src
+                            })
+                    else:
+                        self.train(src, 0, False)
+            except:
+                self.train(src, 0, False)
+
+        pool_ = pool.Pool(len(candidates))
+        for src in candidates:
+            pool_.spawn(worker, src)
+        
+        try:
+            winner = result_box.get(timeout=3.0)
+            pool_.kill(block=False)
+            if winner:
+                self.cache[cid] = {'expires': now + 300, 'data': winner}
+                return winner
+        except:
+            pool_.kill(block=False)
         return None
 
-vavoo = VavooCore()
+brain = NeuralBrain()
 
 # ------------------------------------------------------------------------------
-# 4. STREAMING HANDLER (FAILOVER DESTEKLİ)
+# 4. STREAM HEALTH MONITOR (AKIL YÜRÜTEN AKIŞ KONTROLCÜSÜ)
 # ------------------------------------------------------------------------------
-def stream_segment(target_url, cid):
-    """
-    TS dosyasını indirir. Hata olursa yeni token alır ve tekrar dener.
-    """
-    # 1. Deneme
-    try:
-        h = get_headers(target_url)
-        with session.get(target_url, headers=h, verify=False, stream=True, timeout=(2, 6)) as r:
-            if r.status_code == 200:
-                # 0-Byte Kontrolü
-                first_chunk = next(r.iter_content(chunk_size=4096), None)
-                if first_chunk and len(first_chunk) > 0:
-                    yield first_chunk
-                    for chunk in r.iter_content(chunk_size=65536):
-                        if chunk: yield chunk
-                    return # Başarılı çıkış
+class StreamHealthMonitor:
+    def __init__(self, source):
+        self.source = source
+        self.start_time = time.time()
+        self.bytes_transferred = 0
+        self.last_check = time.time()
+        self.last_bytes = 0
 
-    except: pass
-
-    # 2. Deneme (FALLBACK / RE-RESOLVE)
-    # Eğer buraya geldiysek ya hata aldık ya da 0-byte geldi.
-    # Token süresi dolmuş olabilir. Yeniden resolve et.
-    if cid:
-        # Cache'i sil
-        if cid in vavoo.channel_cache: del vavoo.channel_cache[cid]
+    def update(self, chunk_len):
+        self.bytes_transferred += chunk_len
         
-        # Yeni link bul
-        info = vavoo.resolve_stream_url(cid)
-        if info:
-            # Yeni base URL'yi bul
-            # target_url'den dosya ismini al: http://.../seg-50.ts -> seg-50.ts
-            # Bazen query string olabilir: seg-50.ts?token=... -> split('?')
-            filename = target_url.split('/')[-1].split('?')[0]
+    def check_health(self):
+        """
+        Yayının donup donmadığını tespit eder.
+        True dönerse her şey yolunda, False dönerse DONMA VAR.
+        """
+        now = time.time()
+        delta = now - self.last_check
+        
+        # Her 1 saniyede bir kontrol et
+        if delta >= 1.0:
+            bytes_diff = self.bytes_transferred - self.last_bytes
+            speed_bps = bytes_diff / delta
             
-            # Yeni playlistin base URL'i
-            new_base = info['final_url'].rsplit('/', 1)[0]
+            # İstatistikleri güncelle
+            self.last_check = now
+            self.last_bytes = self.bytes_transferred
             
-            # Yeni tam URL
-            new_target_url = f"{new_base}/{filename}"
+            # Beyni eğit
+            brain.train(self.source, speed_bps, True)
             
-            # Son şans
-            try:
-                h = get_headers(new_target_url)
-                with session.get(new_target_url, headers=h, verify=False, stream=True, timeout=5) as r2:
-                    if r2.status_code == 200:
-                         for chunk in r2.iter_content(chunk_size=65536):
-                            yield chunk
-            except: pass
+            # Donma Kontrolü
+            if speed_bps < MIN_FREEZE_THRESHOLD:
+                # Ceza ver
+                brain.train(self.source, speed_bps, False)
+                return False # Dondu!
+                
+        return True
 
 # ------------------------------------------------------------------------------
 # 5. ENDPOINTS
@@ -199,31 +238,38 @@ def stream_segment(target_url, cid):
 
 @app.route('/')
 def root():
-    data = vavoo.get_channel_list()
+    # En yüksek puanlı kaynaktan listeyi al
+    best_src = sorted(SOURCES, key=lambda s: brain.weights[s], reverse=True)[0]
+    data = None
+    try:
+        r = session.get(f"{best_src}/live2/index", verify=False, timeout=3)
+        if r.status_code == 200: data = r.json()
+    except: pass
+    
+    if not data:
+        # Fallback
+        for src in SOURCES:
+            if src == best_src: continue
+            try:
+                r = session.get(f"{src}/live2/index", verify=False, timeout=2)
+                if r.status_code == 200: 
+                    data = r.json()
+                    break
+            except: continue
+
     if not data: return Response("Service Unavailable", 503)
 
     host_b = request.host_url.rstrip('/').encode()
     out = [b"#EXTM3U"]
     
     for item in data:
-        # Sadece Turkey grubu (İsteğe göre kaldırılabilir)
         if item.get("group") == "Turkey":
             try:
                 u = item['url']
-                # Vavoo URL Parse: .../play/<CID>/...
-                # Örnekler:
-                # http://huhu.to/play/12345/index.m3u8
-                # http://vavoo.to/play/12345.m3u8
+                # Güvenli ID Parsing
+                part = u.split('/play/')[-1]
+                cid = part.split('/')[0].replace('.m3u8', '').split('.')[0]
                 
-                cid = None
-                if '/play/' in u:
-                    part = u.split('/play/')[-1]
-                    if '/' in part: cid = part.split('/')[0]
-                    else: cid = part.replace('.m3u8', '')
-                
-                # CID Temizliği (Nokta vs kalmasın)
-                if cid and '.' in cid: cid = cid.split('.')[0]
-
                 if cid:
                     name = item['name'].replace(',', ' ')
                     out.append(f'#EXTINF:-1 group-title="Turkey",{name}'.encode())
@@ -234,61 +280,111 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def playlist_handler(cid):
-    # Çift uzantı veya nokta temizliği
-    cid = cid.split('.')[0]
-    
-    info = vavoo.resolve_stream_url(cid)
+    info = brain.resolve_playlist(cid)
     if not info: return Response("Not Found", 404)
 
-    # Base URL (Redirect sonrası oluşan gerçek adresin klasörü)
-    # Örn: http://cdn5.huhu.to/hls/12345/index.m3u8 -> http://cdn5.huhu.to/hls/12345
-    base_url = info['final_url'].rsplit('/', 1)[0]
-    
+    base_b = info['base'].encode()
     host_b = request.host_url.rstrip('/').encode()
-    cid_b = cid.encode()
+    cid_b = cid.replace('.m3u8', '').encode()
     
     out = [b"#EXTM3U", b"#EXT-X-VERSION:3", b"#EXT-X-TARGETDURATION:10"]
     
-    # M3U8 Satırlarını İşle
-    lines = info['content'].split(b'\n')
-    for line in lines:
+    for line in info['content'].split(b'\n'):
         line = line.strip()
         if not line: continue
         
         if line.startswith(b'#'):
-            if b"EXT-X-KEY" in line: continue # Şifreli yayınları atla (Vavoo genelde şifresizdir ama önlem)
+            if b"EXT-X-KEY" in line: continue
             if not line.startswith(b"#EXTM3U") and not line.startswith(b"#EXT-X-TARGET"):
                 out.append(line)
         else:
-            # Burası .ts linki
-            line_str = line.decode()
+            if line.startswith(b'http'): target = line
+            else: target = base_b + b'/' + line
             
-            # Mutlak veya Göreli URL Birleştirme
-            # urljoin hem "http://..." hem de "seg-1.ts" durumlarını doğru birleştirir.
-            full_ts_url = urljoin(base_url + "/", line_str)
-            
-            # Proxy Linki Oluştur
-            safe_target = quote(full_ts_url).encode()
+            safe_target = quote(target).encode()
+            # Kaynak bilgisini de URL'e şifreliyoruz (Opsiyonel, şimdilik Brain hallediyor)
             out.append(host_b + b'/ts?cid=' + cid_b + b'&url=' + safe_target)
             
     return Response(b"\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/ts')
 def segment_handler():
-    # URL parametresi artık TAM URL (full_ts_url)
-    url_param = request.args.get('url')
+    url_enc = request.args.get('url')
     cid = request.args.get('cid')
+    if not url_enc: return "Bad", 400
     
-    if not url_param: return "Bad Request", 400
+    target = unquote(url_enc)
     
-    target_url = unquote(url_param)
+    # URL'den domain'i bulup hangi kaynağa ait olduğunu tespit et
+    # Bu, nöral ağı eğitmek için gerekli
+    origin = "https://vavoo.to" # Varsayılan
+    current_source = "https://vavoo.to"
+    try:
+        temp = target.split('/', 3)
+        origin = f"{temp[0]}//{temp[2]}"
+        for s in SOURCES:
+            if s in origin:
+                current_source = s
+                break
+    except: pass
     
-    # Yayını başlat
-    return Response(stream_with_context(stream_segment(target_url, cid)), content_type="video/mp2t")
+    h = get_headers(origin)
+
+    def smart_stream():
+        # Sağlık monitörünü başlat
+        monitor = StreamHealthMonitor(current_source)
+        
+        try:
+            # Bağlantı isteği
+            with session.get(target, headers=h, verify=False, stream=True, timeout=(2, 6)) as r:
+                if r.status_code == 200:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            try:
+                                yield chunk
+                                # Monitöre veri geldiğini bildir
+                                monitor.update(len(chunk))
+                                
+                                # AKIL YÜRÜTME: Yayın donuyor mu?
+                                if not monitor.check_health():
+                                    # Yayın yavaşladı! Döngüyü kır ve Fallback'e git
+                                    # Bu bir "GeneratorExit" değil, bizim kararımız.
+                                    raise Exception("Slow Stream Detected")
+                                    
+                            except (OSError, IOError):
+                                return # İstemci kapattı, normal çıkış.
+                else:
+                    raise Exception("Bad Status Code")
+                    
+        except Exception as e:
+            # Hata veya Yavaşlık durumunda Fallback (Kurtarma Modu)
+            # Eğer CID varsa, başka bir kaynaktan aynı dosyayı bulmaya çalış
+            if cid and str(e) != "GeneratorExit":
+                # Beyni eğit: Bu kaynak başarısız oldu
+                brain.train(current_source, 0, False)
+                
+                # Cache sil ve yeniden en iyi kaynağı bul
+                if cid in brain.cache: del brain.cache[cid]
+                new_info = brain.resolve_playlist(cid)
+                
+                if new_info and new_info['source'] != current_source:
+                    # Yeni kaynaktan aynı dosyayı iste
+                    fname = target.rsplit('/', 1)[-1].split('?')[0]
+                    new_target = f"{new_info['base']}/{fname}"
+                    try:
+                        h2 = get_headers(new_info['source'])
+                        with session.get(new_target, headers=h2, verify=False, stream=True, timeout=5) as r2:
+                            if r2.status_code == 200:
+                                for chunk in r2.iter_content(chunk_size=65536):
+                                    yield chunk
+                    except: pass
+
+    return Response(stream_with_context(smart_stream()), content_type="video/mp2t")
 
 if __name__ == "__main__":
-    print(f" ► VAVOO TITANIUM (FULL COMPATIBLE)")
-    print(f" ► FEATURE: Auto-Redirect & Token Healing")
-    print(f" ► LISTENING: 8080")
+    print(f" ► TITAN V2 - NEURAL EDITION")
+    print(f" ► AI: Reinforcement Learning Active")
+    print(f" ► PROTECTION: Anti-Freeze Monitor Active")
+    # Log: None (Maksimum performans)
     server = WSGIServer(('0.0.0.0', 8080), app, backlog=65535, log=None)
     server.serve_forever()
