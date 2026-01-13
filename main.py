@@ -1,5 +1,5 @@
 from gevent import monkey; monkey.patch_all()
-import requests, urllib3, logging
+import requests, urllib3, logging, re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
@@ -22,24 +22,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# --- PERFORMANS OPTİMİZASYONU ---
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
-# Bağlantı havuzunu ve hızı artırmak için Adapter ayarları
 retry_strategy = Retry(
     total=3,
     backoff_factor=0.1,
     status_forcelist=[500, 502, 503, 504],
 )
 adapter = HTTPAdapter(
-    pool_connections=100,  # Aynı anda daha fazla bağlantıya izin ver
-    pool_maxsize=100,      # Havuz boyutunu artır
+    pool_connections=100,
+    pool_maxsize=100,
     max_retries=retry_strategy
 )
 session.mount("https://", adapter)
 session.mount("http://", adapter)
-# -------------------------------
 
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
@@ -217,6 +214,44 @@ def api_m3u8():
         if r.status_code != 200:
             return Response(f"Source Error: {r.status_code}", status=r.status_code)
 
+        # ----------------------------------------------------------------------
+        # EN YÜKSEK KALİTE SEÇİM MANTIĞI (AUTO-BEST QUALITY)
+        # ----------------------------------------------------------------------
+        if "EXT-X-STREAM-INF" in r.text:
+            lines = r.text.splitlines()
+            best_url = None
+            max_bw = 0
+            
+            # Tüm varyasyonları tara
+            for i, line in enumerate(lines):
+                if "#EXT-X-STREAM-INF" in line:
+                    # BANDWIDTH değerini yakala
+                    bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                    bw = int(bw_match.group(1)) if bw_match else 0
+                    
+                    # Eğer bu kalite daha yüksekse, bunu seç
+                    if bw > max_bw:
+                        max_bw = bw
+                        # URL genellikle bir alt satırdadır
+                        if i + 1 < len(lines):
+                            potential_url = lines[i+1].strip()
+                            if potential_url and not potential_url.startswith('#'):
+                                best_url = potential_url
+
+            # Eğer daha iyi bir kalite linki bulduysak, hedefi güncelle
+            if best_url:
+                # Relative URL kontrolü (http ile başlamıyorsa base_url ekle)
+                if not best_url.startswith('http'):
+                    base_temp = r.url.rsplit('/', 1)[0]
+                    target_url = f"{base_temp}/{best_url}"
+                else:
+                    target_url = best_url
+                
+                # Yeni yüksek kalite linkini tekrar çek
+                r = session.get(target_url, headers=headers, verify=False, timeout=10)
+
+        # ----------------------------------------------------------------------
+
         final_url = r.url
         base_url = final_url.rsplit('/', 1)[0]
         host = request.host_url.rstrip('/')
@@ -256,11 +291,10 @@ def api_ts():
         headers = {"User-Agent": USER_AGENT}
         if referer: headers["Referer"] = referer
 
-        # Chunk boyutu artırıldı (64KB)
         r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=10)
         
         return Response(
-            stream_with_context(r.iter_content(chunk_size=65536)), 
+            stream_with_context(r.iter_content(chunk_size=65536)),
             content_type=r.headers.get('Content-Type', 'video/mp2t'),
             status=r.status_code
         )
