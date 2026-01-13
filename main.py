@@ -1,5 +1,7 @@
 from gevent import monkey; monkey.patch_all()
 import requests, urllib3, logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 
@@ -20,8 +22,24 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+# --- PERFORMANS OPTİMİZASYONU ---
 session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
+session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
+
+# Bağlantı havuzunu ve hızı artırmak için Adapter ayarları
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.1,
+    status_forcelist=[500, 502, 503, 504],
+)
+adapter = HTTPAdapter(
+    pool_connections=100,  # Aynı anda daha fazla bağlantıya izin ver
+    pool_maxsize=100,      # Havuz boyutunu artır
+    max_retries=retry_strategy
+)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+# -------------------------------
 
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
@@ -238,10 +256,11 @@ def api_ts():
         headers = {"User-Agent": USER_AGENT}
         if referer: headers["Referer"] = referer
 
+        # Chunk boyutu artırıldı (64KB)
         r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=10)
         
         return Response(
-            stream_with_context(r.iter_content(chunk_size=8192)),
+            stream_with_context(r.iter_content(chunk_size=65536)), 
             content_type=r.headers.get('Content-Type', 'video/mp2t'),
             status=r.status_code
         )
