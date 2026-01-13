@@ -336,7 +336,7 @@ def api_ts():
                    if name.lower() not in excluded_headers]
 
         def generate():
-            for chunk in r.iter_content(chunk_size=16384): 
+            for chunk in r.iter_content(chunk_size=4096): 
                 if chunk:
                     yield chunk
 
