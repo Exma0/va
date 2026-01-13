@@ -12,7 +12,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 REF_ANDRO = 'https://taraftarium.is/'
 REF_HTML = 'https://inatspor35.xyz/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
-REF_VAVOO = 'https://vavoo.to/'  # <-- YENİ EKLENDİ
+REF_VAVOO = 'https://vavoo.to/'
 
 # KAYNAK ADRESLERİ
 SOURCE_VAVOO = "https://vavoo.to"
@@ -166,21 +166,27 @@ def root():
     out = ["#EXTM3U"]
 
     for c in ANDRO_LIST:
+        # Andro listesinde isim temizliği (Genel)
+        name = c["name"]
         real_url = URL_ANDRO.format(c['id'])
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_ANDRO}"
-        out.append(f'#EXTINF:-1 group-title="Andro",{c["name"]}')
+        out.append(f'#EXTINF:-1 group-title="Andro",{name}')
         out.append(p_url)
 
     for c in HTML_LIST:
+        # HTML listesi temizliği: (Alt) ve benzeri parantezleri siler
+        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_HTML.format(c['id'])
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_HTML}"
-        out.append(f'#EXTINF:-1 group-title="HTML",{c["name"]}')
+        out.append(f'#EXTINF:-1 group-title="HTML",{name}')
         out.append(p_url)
 
     for c in FIXED_LIST:
+        # Fixed listesi temizliği: (Sabit) ve benzeri parantezleri siler
+        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_FIXED.format(c['id'])
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_FIXED}"
-        out.append(f'#EXTINF:-1 group-title="Fixed",{c["name"]}')
+        out.append(f'#EXTINF:-1 group-title="Fixed",{name}')
         out.append(p_url)
 
     try:
@@ -192,9 +198,13 @@ def root():
                     raw_url = i['url']
                     if '/play/' in raw_url:
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
+                        
+                        # VAVOO İsim Temizliği
                         name = i["name"].replace(",", " ")
+                        # (1), (7), (23) gibi ifadeleri siler
+                        name = re.sub(r'\s*\(\d+\)', '', name).strip()
+
                         v_real_url = URL_VAVOO.format(cid)
-                        # <-- DÜZELTME: Vavoo için de Referans parametresi (&r=) eklendi
                         p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
                         out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
                         out.append(p_url)
