@@ -26,7 +26,6 @@ app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 session = requests.Session()
-# Keep-Alive ve Pool ayarları performans için artırıldı
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
 retry_strategy = Retry(
@@ -35,8 +34,8 @@ retry_strategy = Retry(
     status_forcelist=[500, 502, 503, 504],
 )
 adapter = HTTPAdapter(
-    pool_connections=500, # Yüksek eşzamanlı bağlantı için artırıldı
-    pool_maxsize=500,
+    pool_connections=200,
+    pool_maxsize=200,
     max_retries=retry_strategy,
     pool_block=False
 )
@@ -172,10 +171,12 @@ def root():
         name = c["name"]
         real_url = URL_ANDRO.format(c['id'])
         
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_ANDRO}"
         out.append(f'#EXTINF:-1 group-title="Andro",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
         out.append(f'#EXTINF:-1 group-title="Andro",{name} (Direkt)')
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={REF_ANDRO}')
@@ -187,10 +188,12 @@ def root():
         name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_HTML.format(c['id'])
         
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_HTML}"
         out.append(f'#EXTINF:-1 group-title="HTML",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
         out.append(f'#EXTINF:-1 group-title="HTML",{name} (Direkt)')
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={REF_HTML}')
@@ -202,10 +205,12 @@ def root():
         name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_FIXED.format(c['id'])
         
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_FIXED}"
         out.append(f'#EXTINF:-1 group-title="Fixed",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
         out.append(f'#EXTINF:-1 group-title="Fixed",{name} (Direkt)')
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={REF_FIXED}')
@@ -222,14 +227,18 @@ def root():
                     raw_url = i['url']
                     if '/play/' in raw_url:
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
+                        
                         name = i["name"].replace(",", " ")
                         name = re.sub(r'\s*\(\d+\)', '', name).strip()
+
                         v_real_url = URL_VAVOO.format(cid)
 
+                        # 1. Proxy Linki
                         p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
                         out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
                         out.append(p_url)
 
+                        # 2. Direkt Link (Headerlı)
                         out.append(f'#EXTINF:-1 group-title="Vavoo",{name} (Direkt)')
                         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
                         out.append(f'#EXTVLCOPT:http-referrer={REF_VAVOO}')
@@ -255,8 +264,7 @@ def api_m3u8():
         if r.status_code != 200:
             return Response(f"Source Error: {r.status_code}", status=r.status_code)
 
-        # M3U8 İçeriğini Parse Etme ve Proxy Linkine Çevirme
-        if "EXT-X-STREAM-INF" in r.text: # Master Playlist ise en iyi kaliteyi bul
+        if "EXT-X-STREAM-INF" in r.text:
             lines = r.text.splitlines()
             best_url = None
             max_bw = 0
@@ -299,7 +307,6 @@ def api_m3u8():
                 else:
                     full_ts_url = f"{base_url}/{line}"
                 
-                # TS linklerini proxy'ye yönlendir
                 proxy_ts_link = f"{host}/api/ts?u={full_ts_url}"
                 if referer:
                     proxy_ts_link += f"&r={referer}"
@@ -319,35 +326,24 @@ def api_ts():
     if not target_url: return Response("No URL", 400)
 
     try:
-        # Client Headers (Range vs) Yakala ve Forward Et
-        # Bu kısım donmaları engeller çünkü oynatıcı parça istiyorsa onu iletir
-        req_headers = {key: value for (key, value) in request.headers if key != 'Host'}
-        req_headers['User-Agent'] = USER_AGENT
-        if referer: 
-            req_headers['Referer'] = referer
-        else:
-            req_headers['Referer'] = target_url
+        headers = {"User-Agent": USER_AGENT}
+        if referer: headers["Referer"] = referer
 
-        # STREAM TRUE ÇOK ÖNEMLİ
-        r = session.get(target_url, headers=req_headers, stream=True, verify=False, timeout=10)
+        r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=15)
         
-        # Gereksiz Headerları Temizle (Hop-by-hop headers removal)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         headers = [(name, value) for (name, value) in r.headers.items()
                    if name.lower() not in excluded_headers]
 
-        # CHUNK STREAMING JENERATÖRÜ
         def generate():
-            # 8192 bytes (8KB) network dostu paket boyutudur
-            for chunk in r.iter_content(chunk_size=8192): 
+            for chunk in r.iter_content(chunk_size=16384): 
                 if chunk:
                     yield chunk
 
         return Response(stream_with_context(generate()), headers=headers, status=r.status_code)
 
     except Exception as e:
-        # Hata durumunda boş 500 dön, bağlantıyı kapat
-        return Response("Error", 500)
+        return Response(str(e), 500)
 
 if __name__ == "__main__":
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
