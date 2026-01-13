@@ -1,15 +1,16 @@
 from gevent import monkey; monkey.patch_all()
 import requests, urllib3, logging, time, re
 from gevent.pywsgi import WSGIServer
+from gevent import spawn, sleep, lock
 from flask import Flask, Response, request, stream_with_context
 
 # ==============================================================================
-# AYARLAR
+# AYARLAR VE YAPILANDIRMA
 # ==============================================================================
 PORT = 8080
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
-# PHP Kodundaki Referanslar
+# Referanslar
 REF_ANDRO = 'https://taraftarium.is/'
 REF_HTML  = 'https://inatspor35.xyz/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
@@ -28,7 +29,7 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 # ==============================================================================
-# 1. TAM LİSTE: ANDRO KANALLARI (PHP'den Birebir)
+# 1. TAM LİSTE: ANDRO KANALLARI
 # ==============================================================================
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
@@ -87,7 +88,7 @@ ANDRO_LIST = [
 ]
 
 # ==============================================================================
-# 2. TAM LİSTE: HTML PERFECT PLAYER (PHP'den Birebir)
+# 2. TAM LİSTE: HTML PERFECT PLAYER
 # ==============================================================================
 HTML_LIST = [
     {'name':'BeIN Sports 1 (Alt)','id':'yayininat'},
@@ -118,7 +119,7 @@ HTML_LIST = [
 ]
 
 # ==============================================================================
-# 3. TAM LİSTE: SABİT PERFECT PLAYER (PHP'den Birebir)
+# 3. TAM LİSTE: SABİT PERFECT PLAYER
 # ==============================================================================
 FIXED_LIST = [
     {"name":"BeIN Sports 1 (Sabit)","id":"yayin1"},
@@ -156,9 +157,95 @@ FIXED_LIST = [
 ]
 
 # ==============================================================================
-# VAVOO OPTİMİZE EDİLMİŞ CACHE YAPISI
+# BUFFERING SİSTEMİ (Donmayı Önleyen Motor)
 # ==============================================================================
-m3u8_cache = {}
+buffers = {} 
+buffer_lock = lock.Semaphore()
+
+class StreamBuffer:
+    def __init__(self, stream_url, referer=None):
+        self.stream_url = stream_url
+        self.referer = referer
+        self.base_url = stream_url.rsplit('/', 1)[0]
+        self.ts_cache = {} 
+        self.playlist_content = ""
+        self.last_access = time.time()
+        self.active = True
+        self.downloading = set()
+
+    def update_access(self):
+        self.last_access = time.time()
+
+    def is_expired(self):
+        # 45 saniye işlem yoksa düşür
+        return (time.time() - self.last_access) > 45
+
+def download_segment(buffer_obj, seg_url, seg_name):
+    if seg_name in buffer_obj.ts_cache or seg_name in buffer_obj.downloading:
+        return
+
+    buffer_obj.downloading.add(seg_name)
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        if buffer_obj.referer: headers["Referer"] = buffer_obj.referer
+        
+        r = session.get(seg_url, headers=headers, verify=False, timeout=5)
+        if r.status_code == 200:
+            buffer_obj.ts_cache[seg_name] = r.content
+            # Bellek yönetimi: En son 25 parçayı tut
+            if len(buffer_obj.ts_cache) > 25:
+                keys_to_del = list(buffer_obj.ts_cache.keys())[:-25]
+                for k in keys_to_del:
+                    if k in buffer_obj.ts_cache: del buffer_obj.ts_cache[k]
+    except: pass
+    finally:
+        if seg_name in buffer_obj.downloading:
+            buffer_obj.downloading.remove(seg_name)
+
+def buffer_worker(stream_id):
+    print(f"Buffering Başladı: {stream_id}")
+    while True:
+        with buffer_lock:
+            if stream_id not in buffers: break
+            buf = buffers[stream_id]
+        
+        if buf.is_expired():
+            print(f"Buffering Durdu (Timeout): {stream_id}")
+            with buffer_lock:
+                if stream_id in buffers: del buffers[stream_id]
+            break
+
+        try:
+            headers = {"User-Agent": USER_AGENT}
+            if buf.referer: headers["Referer"] = buf.referer
+            
+            r = session.get(buf.stream_url, headers=headers, verify=False, timeout=5)
+            if r.status_code == 200:
+                lines = r.text.splitlines()
+                tasks = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith('#'): continue
+                    
+                    full_ts_url = line if line.startswith('http') else f"{buf.base_url}/{line}"
+                    seg_name = line.split('/')[-1].split('?')[0]
+                    
+                    if seg_name not in buf.ts_cache:
+                        tasks.append(spawn(download_segment, buf, full_ts_url, seg_name))
+                
+                buf.playlist_content = r.text
+                gevent.joinall(tasks, timeout=2.5) 
+            
+        except Exception as e:
+            print(f"Hata {stream_id}: {e}")
+        
+        sleep(2)
+
+# ==============================================================================
+# VAVOO CACHE SİSTEMİ (Orijinal Koddan Korundu)
+# ==============================================================================
+vavoo_cache = {}
 
 def parse_m3u8_to_map(base_url, content):
     segment_map = {}
@@ -173,28 +260,23 @@ def parse_m3u8_to_map(base_url, content):
 
 def get_fresh_vavoo(cid, force_refresh=False):
     now = time.time()
-    if not force_refresh and cid in m3u8_cache and (now - m3u8_cache[cid]['time'] < 4.0):
-        return m3u8_cache[cid]['map'], m3u8_cache[cid]['raw_m3u8']
+    if not force_refresh and cid in vavoo_cache and (now - vavoo_cache[cid]['time'] < 4.0):
+        return vavoo_cache[cid]['map'], vavoo_cache[cid]['raw_m3u8']
     try:
         r = session.get(f"{SOURCE_VAVOO}/play/{cid}/index.m3u8", verify=False, timeout=5)
         if r.status_code == 200:
             base_url = r.url.rsplit('/', 1)[0]
             content = r.text
             seg_map = parse_m3u8_to_map(base_url, content)
-            m3u8_cache[cid] = {'time': now, 'map': seg_map, 'raw_m3u8': content}
+            vavoo_cache[cid] = {'time': now, 'map': seg_map, 'raw_m3u8': content}
             return seg_map, content
     except Exception as e:
         print(f"Vavoo Error ({cid}): {e}")
     return None, None
 
-# ==============================================================================
-# PROXY FONKSİYONLARI
-# ==============================================================================
 def universal_proxy_req(url, referer=None):
-    """Hem Vavoo hem diğer kanallar için ortak akış fonksiyonu"""
     headers = {"User-Agent": USER_AGENT}
     if referer: headers["Referer"] = referer
-    
     try:
         r = session.get(url, headers=headers, stream=True, verify=False, timeout=10)
         if r.status_code == 200:
@@ -203,35 +285,42 @@ def universal_proxy_req(url, referer=None):
     except Exception as e:
         return Response(str(e), 502)
 
+# ==============================================================================
+# ENDPOINTLER
+# ==============================================================================
+
 @app.route('/')
 def root():
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
 
-    # 1️⃣ ANDRO KANALLARI EKLE
+    # 1. ANDRO LİSTESİ (Buffered)
     for c in ANDRO_LIST:
         real_url = URL_ANDRO.format(c['id'])
-        proxy_url = f"{host}/static_p?u={real_url}&r={REF_ANDRO}"
+        sid = f"andro_{c['id']}"
+        proxy_url = f"{host}/watch_m3u8?sid={sid}&u={real_url}&r={REF_ANDRO}"
         out.append(f'#EXTINF:-1 group-title="Andro",{c["name"]}')
         out.append(proxy_url)
 
-    # 2️⃣ HTML KANALLARI EKLE
+    # 2. HTML LİSTESİ (Buffered)
     for c in HTML_LIST:
         real_url = URL_HTML.format(c['id'])
-        proxy_url = f"{host}/static_p?u={real_url}&r={REF_HTML}"
+        sid = f"html_{c['id']}"
+        proxy_url = f"{host}/watch_m3u8?sid={sid}&u={real_url}&r={REF_HTML}"
         out.append(f'#EXTINF:-1 group-title="HTML",{c["name"]}')
         out.append(proxy_url)
 
-    # 3️⃣ FIXED KANALLARI EKLE
+    # 3. FIXED LİSTESİ (Buffered)
     for c in FIXED_LIST:
         real_url = URL_FIXED.format(c['id'])
-        proxy_url = f"{host}/static_p?u={real_url}&r={REF_FIXED}"
+        sid = f"fixed_{c['id']}"
+        proxy_url = f"{host}/watch_m3u8?sid={sid}&u={real_url}&r={REF_FIXED}"
         out.append(f'#EXTINF:-1 group-title="Fixed",{c["name"]}')
         out.append(proxy_url)
 
-    # 4️⃣ VAVOO KANALLARI EKLE
+    # 4. VAVOO KANALLARI (Legacy/Direct)
     try:
-        r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=8)
+        r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=6)
         v_data = r.json()
         for i in v_data:
             if i.get("group") == "Turkey":
@@ -247,56 +336,77 @@ def root():
             
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
-# ==============================================================================
-# ENDPOINT: STATİK KANAL PROXY (Andro, HTML, Fixed için)
-# ==============================================================================
-@app.route('/static_p')
-def static_proxy_m3u8():
+# --- BUFFERED STREAM ENDPOINTS ---
+@app.route('/watch_m3u8')
+def watch_m3u8():
+    sid = request.args.get('sid')
     target_url = request.args.get('u')
     referer = request.args.get('r')
     
-    if not target_url: return Response("Missing URL", 400)
+    if not sid or not target_url: return Response("Missing params", 400)
+    host = request.host_url.rstrip('/')
+
+    with buffer_lock:
+        if sid not in buffers:
+            buffers[sid] = StreamBuffer(target_url, referer)
+            spawn(buffer_worker, sid)
+        else:
+            buffers[sid].update_access()
+
+    # Worker'ın ilk veriyi çekmesini bekle
+    for _ in range(8):
+        if buffers[sid].playlist_content: break
+        sleep(0.25)
+        
+    if not buffers[sid].playlist_content:
+        return Response("#EXTM3U\n#EXT-X-ERROR: Loading...", content_type="application/vnd.apple.mpegurl")
+
+    org_content = buffers[sid].playlist_content
+    new_lines = []
     
+    for line in org_content.splitlines():
+        line = line.strip()
+        if not line: continue
+        if line.startswith('#'):
+            new_lines.append(line)
+        else:
+            seg_name = line.split('/')[-1].split('?')[0]
+            proxy_ts = f"{host}/watch_ts?sid={sid}&file={seg_name}"
+            new_lines.append(proxy_ts)
+
+    return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
+
+@app.route('/watch_ts')
+def watch_ts():
+    sid = request.args.get('sid')
+    filename = request.args.get('file')
+    
+    if not sid or not filename: return Response("Bad Request", 400)
+    
+    with buffer_lock:
+        if sid not in buffers: return Response("Session Expired", 404)
+        buf = buffers[sid]
+        buf.update_access()
+
+    # RAM'den ver
+    if filename in buf.ts_cache:
+        return Response(buf.ts_cache[filename], content_type="video/mp2t")
+    
+    # Acil durum: RAM'de yoksa indir ve ver (Donmayı önlemek için fallback)
+    real_ts_url = f"{buf.base_url}/{filename}"
     try:
         headers = {"User-Agent": USER_AGENT}
-        if referer: headers["Referer"] = referer
-        r = session.get(target_url, headers=headers, verify=False, timeout=10)
-        
-        if r.status_code != 200: return Response("Source Error", r.status_code)
-        
-        base_url = target_url.rsplit('/', 1)[0]
-        host = request.host_url.rstrip('/')
-        new_lines = []
-        
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line: continue
-            if line.startswith('#'):
-                new_lines.append(line)
-            else:
-                full_ts_url = line if line.startswith('http') else f"{base_url}/{line}"
-                proxy_ts_link = f"{host}/static_ts?u={full_ts_url}&r={referer}"
-                new_lines.append(proxy_ts_link)
-                
-        return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
-    except Exception as e:
-        return Response(str(e), 500)
+        if buf.referer: headers["Referer"] = buf.referer
+        r = session.get(real_ts_url, headers=headers, stream=True, verify=False, timeout=5)
+        return Response(stream_with_context(r.iter_content(8192)), content_type="video/mp2t")
+    except:
+        return Response("Segment fail", 404)
 
-@app.route('/static_ts')
-def static_proxy_ts():
-    target_url = request.args.get('u')
-    referer = request.args.get('r')
-    if not target_url: return Response("Missing URL", 400)
-    return universal_proxy_req(target_url, referer)
-
-# ==============================================================================
-# ENDPOINT: VAVOO ENDPOINTS (Optimize Hali)
-# ==============================================================================
+# --- VAVOO ENDPOINTS (Direct) ---
 @app.route('/live/<cid>.m3u8')
 def vavoo_m3u8(cid):
     seg_map, content = get_fresh_vavoo(cid, force_refresh=False)
     if not content: return Response("Stream Not Found", 404)
-
     host = request.host_url.rstrip('/')
     out = []
     for line in content.splitlines():
@@ -315,19 +425,17 @@ def vavoo_ts():
     cid = request.args.get('cid')
     filename = request.args.get('file')
     if not cid or not filename: return Response("Bad Request", 400)
-
     seg_map, _ = get_fresh_vavoo(cid, force_refresh=False)
     target_url = seg_map.get(filename) if seg_map else None
-
     if not target_url:
         seg_map, _ = get_fresh_vavoo(cid, force_refresh=True)
         if seg_map: target_url = seg_map.get(filename)
-
     if target_url:
         return universal_proxy_req(target_url, referer=None)
     else:
         return Response("Segment expired", 404)
 
 if __name__ == "__main__":
-    print(f"Yayın sunucusu {PORT} portunda başlatıldı. TÜM KANALLAR EKLENDİ.")
+    print(f"Sunucu {PORT} portunda başlatıldı.")
+    print("Modlar: Andro/HTML/Fixed -> AKTİF CACHE | Vavoo -> PASİF PROXY")
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
