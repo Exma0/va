@@ -1,6 +1,7 @@
 from gevent import monkey; monkey.patch_all()
 
 import requests, urllib3, logging, re
+from urllib.parse import quote, unquote # URL Encode için gerekli
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
@@ -9,7 +10,7 @@ from flask import Flask, Response, request, stream_with_context
 
 # ================= CONFIG =================
 PORT = 8080
-CHUNK_SIZE = 16384
+CHUNK_SIZE = 16384 # 64KB daha stabil olabilir, denenebilir.
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -37,8 +38,8 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
 retry = Retry(
-    total=2,
-    backoff_factor=0.05,
+    total=3, # Retry sayısı 3'e çıkarıldı
+    backoff_factor=0.1,
     status_forcelist=[500, 502, 503, 504],
     allowed_methods=["GET"]
 )
@@ -54,6 +55,7 @@ session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 # ================= CHANNEL LISTS =================
+# (Listeler aynı kaldığı için burayı kısaltıyorum, senin kodundaki listeler geçerli)
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
@@ -180,10 +182,14 @@ def root():
     out = ["#EXTM3U"]
 
     def add_channel(group, name, real_url, ref):
+        # URL'leri güvenli hale getir (Encode)
+        enc_url = quote(real_url)
+        enc_ref = quote(ref)
+        
         # Proxy
         out.append(f'#EXTINF:-1 group-title="{group}",{name}')
-        out.append(f'{host}/api/m3u8?u={real_url}&r={ref}')
-        # Direkt (Headerlı)
+        out.append(f'{host}/api/m3u8?u={enc_url}&r={enc_ref}')
+        # Direkt (VLC vb. için Headerlı)
         out.append(f'#EXTINF:-1 group-title="{group}",{name} (Direkt)')
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={ref}')
@@ -201,14 +207,18 @@ def root():
         name = re.sub(r'\s*\(.*?\)', '', c["name"])
         add_channel("Fixed", name, URL_FIXED.format(c["id"]), REF_FIXED)
 
+    # Vavoo Kısmı - Hata korumalı
     try:
-        r = session.get(f"{SOURCE_VAVOO}/live2/index", timeout=5, verify=False)
-        for i in r.json():
-            if i.get("group") == "Turkey" and "/play/" in i.get("url",""):
-                cid = i["url"].split("/play/")[1].split("/")[0]
-                name = re.sub(r'\s*\(\d+\)', '', i["name"]).replace(",", " ")
-                add_channel("Vavoo", name, URL_VAVOO.format(cid), REF_VAVOO)
-    except:
+        r = session.get(f"{SOURCE_VAVOO}/live2/index", timeout=4, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            for i in data:
+                if i.get("group") == "Turkey" and "/play/" in i.get("url",""):
+                    cid = i["url"].split("/play/")[1].split("/")[0]
+                    name = re.sub(r'\s*\(\d+\)', '', i["name"]).replace(",", " ")
+                    add_channel("Vavoo", name, URL_VAVOO.format(cid), REF_VAVOO)
+    except Exception as e:
+        print(f"Vavoo Hatası: {e}")
         pass
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
@@ -218,14 +228,21 @@ def root():
 def api_m3u8():
     u = request.args.get('u')
     rfr = request.args.get('r')
+    
+    # URL encoded geldiyse bazen decode gerekebilir ama requests genelde çözer.
+    # Biz yine de parametre olarak gelen URL'in düzgün olduğundan emin olalım.
     if not u:
         return Response("No URL", 400)
 
     h = {"User-Agent": USER_AGENT}
     if rfr: h["Referer"] = rfr
 
-    r = session.get(u, headers=h, timeout=10, verify=False)
+    try:
+        r = session.get(u, headers=h, timeout=10, verify=False)
+    except Exception as e:
+        return Response(f"Fetch Error: {e}", 502)
 
+    # Adaptive Stream (Multi-quality) ise en iyisini seç
     if "EXT-X-STREAM-INF" in r.text:
         best, bw = None, 0
         l = r.text.splitlines()
@@ -238,7 +255,10 @@ def api_m3u8():
         if best:
             base = r.url.rsplit('/',1)[0]
             u = best if best.startswith('http') else f"{base}/{best}"
-            r = session.get(u, headers=h, timeout=10, verify=False)
+            try:
+                r = session.get(u, headers=h, timeout=10, verify=False)
+            except:
+                pass # İlk istek başarısız olursa orijinal içerikle devam et
 
     base = r.url.rsplit('/',1)[0]
     host = request.host_url.rstrip('/')
@@ -248,9 +268,11 @@ def api_m3u8():
         if not line or line.startswith('#'):
             out.append(line)
         else:
+            # TS linklerini tam adresine çevir
             full = line if line.startswith('http') else f"{base}/{line}"
-            ts = f"{host}/api/ts?u={full}"
-            if rfr: ts += f"&r={rfr}"
+            # TS linkini proxy'den geçirmek için encode et
+            ts = f"{host}/api/ts?u={quote(full)}"
+            if rfr: ts += f"&r={quote(rfr)}"
             out.append(ts)
 
     return Response("\n".join(out), content_type="application/vnd.apple.mpegurl")
@@ -260,19 +282,26 @@ def api_m3u8():
 def api_ts():
     u = request.args.get('u')
     rfr = request.args.get('r')
+    
     if not u:
         return Response("No URL", 400)
 
     h = {"User-Agent": USER_AGENT}
     if rfr: h["Referer"] = rfr
 
-    r = session.get(u, headers=h, stream=True, verify=False, timeout=(5, None))
+    try:
+        r = session.get(u, headers=h, stream=True, verify=False, timeout=(5, 10))
+    except:
+        return Response("TS Fetch Error", 502)
 
     def gen():
-        for c in r.iter_content(chunk_size=CHUNK_SIZE):
-            if c:
-                yield c
-                sleep(0)
+        try:
+            for c in r.iter_content(chunk_size=CHUNK_SIZE):
+                if c:
+                    yield c
+                    sleep(0) # Gevent context switch
+        except:
+            pass
 
     return Response(
         stream_with_context(gen()),
@@ -282,4 +311,5 @@ def api_ts():
 
 # ================= START =================
 if __name__ == "__main__":
+    print(f"Server is running on port {PORT}")
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
