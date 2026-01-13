@@ -6,7 +6,7 @@ from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
 
 PORT = 8080
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # REFERANS ADRESLERİ
 REF_ANDRO = 'https://taraftarium.is/'
@@ -34,9 +34,10 @@ retry_strategy = Retry(
     status_forcelist=[500, 502, 503, 504],
 )
 adapter = HTTPAdapter(
-    pool_connections=100,
-    pool_maxsize=100,
-    max_retries=retry_strategy
+    pool_connections=200,
+    pool_maxsize=200,
+    max_retries=retry_strategy,
+    pool_block=False
 )
 session.mount("https://", adapter)
 session.mount("http://", adapter)
@@ -227,7 +228,6 @@ def root():
                     if '/play/' in raw_url:
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                         
-                        # İsim Temizliği
                         name = i["name"].replace(",", " ")
                         name = re.sub(r'\s*\(\d+\)', '', name).strip()
 
@@ -329,16 +329,21 @@ def api_ts():
         headers = {"User-Agent": USER_AGENT}
         if referer: headers["Referer"] = referer
 
-        r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=10)
+        r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=15)
         
-        return Response(
-            stream_with_context(r.iter_content(chunk_size=None)),
-            content_type=r.headers.get('Content-Type', 'video/mp2t'),
-            status=r.status_code
-        )
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        headers = [(name, value) for (name, value) in r.headers.items()
+                   if name.lower() not in excluded_headers]
+
+        def generate():
+            for chunk in r.iter_content(chunk_size=16384): 
+                if chunk:
+                    yield chunk
+
+        return Response(stream_with_context(generate()), headers=headers, status=r.status_code)
 
     except Exception as e:
         return Response(str(e), 500)
-# --- https://va-fueb.onrender.com/ ---
+
 if __name__ == "__main__":
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
