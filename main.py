@@ -8,11 +8,14 @@ from flask import Flask, Response, request, stream_with_context
 PORT = 8080
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
+# REFERANS ADRESLERİ
 REF_ANDRO = 'https://taraftarium.is/'
 REF_HTML = 'https://inatspor35.xyz/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
-SOURCE_VAVOO = "https://vavoo.to"
+REF_VAVOO = 'https://vavoo.to/'  # <-- YENİ EKLENDİ
 
+# KAYNAK ADRESLERİ
+SOURCE_VAVOO = "https://vavoo.to"
 URL_ANDRO = 'https://andro.adece12.sbs/checklist/{}.m3u8'
 URL_HTML = 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'
 URL_FIXED = 'https://k93.t24hls8.sbs/{}.m3u8'
@@ -191,7 +194,8 @@ def root():
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                         name = i["name"].replace(",", " ")
                         v_real_url = URL_VAVOO.format(cid)
-                        p_url = f"{host}/api/m3u8?u={v_real_url}"
+                        # <-- DÜZELTME: Vavoo için de Referans parametresi (&r=) eklendi
+                        p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
                         out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
                         out.append(p_url)
                 except: pass
