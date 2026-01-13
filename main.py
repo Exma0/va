@@ -1,47 +1,59 @@
 from gevent import monkey; monkey.patch_all()
+
 import requests, urllib3, logging, re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
+from gevent import sleep
 from flask import Flask, Response, request, stream_with_context
 
+# ================== CONFIG ==================
 PORT = 8080
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+CHUNK_SIZE = 16384
 
-# REFERANS ADRESLERİ
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 REF_ANDRO = 'https://taraftarium.is/'
-REF_HTML = 'https://inatspor35.xyz/'
+REF_HTML  = 'https://inatspor35.xyz/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
 REF_VAVOO = 'https://vavoo.to/'
 
-# KAYNAK ADRESLERİ
 SOURCE_VAVOO = "https://vavoo.to"
 URL_ANDRO = 'https://andro.adece12.sbs/checklist/{}.m3u8'
-URL_HTML = 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'
+URL_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'
 URL_FIXED = 'https://k93.t24hls8.sbs/{}.m3u8'
 URL_VAVOO = "https://vavoo.to/play/{}/index.m3u8"
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings()
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+# ================== SESSION ==================
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=0.1,
+retry = Retry(
+    total=2,
+    backoff_factor=0.05,
     status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET"]
 )
+
 adapter = HTTPAdapter(
     pool_connections=200,
     pool_maxsize=200,
-    max_retries=retry_strategy,
+    max_retries=retry,
     pool_block=False
 )
-session.mount("https://", adapter)
-session.mount("http://", adapter)
 
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+# ================== CHANNEL LISTS ==================
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
@@ -161,189 +173,105 @@ FIXED_LIST = [
     {"name":"Tabii Spor 6 (Sabit)","id":"yayinex6"},
 ]
 
+# ================== ROOT ==================
 @app.route('/')
 def root():
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
 
-    # ---------------- ANDRO LİSTESİ ----------------
-    for c in ANDRO_LIST:
-        name = c["name"]
-        real_url = URL_ANDRO.format(c['id'])
-        
-        # 1. Proxy Linki
-        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_ANDRO}"
-        out.append(f'#EXTINF:-1 group-title="Andro",{name}')
-        out.append(p_url)
+    for lst, url_tpl, ref, grp in [
+        (ANDRO_LIST, URL_ANDRO, REF_ANDRO, "Andro"),
+        (HTML_LIST,  URL_HTML,  REF_HTML,  "HTML"),
+        (FIXED_LIST, URL_FIXED, REF_FIXED, "Fixed"),
+    ]:
+        for c in lst:
+            name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
+            real = url_tpl.format(c['id'])
+            out.append(f'#EXTINF:-1 group-title="{grp}",{name}')
+            out.append(f'{host}/api/m3u8?u={real}&r={ref}')
 
-        # 2. Direkt Link (Headerlı)
-        out.append(f'#EXTINF:-1 group-title="Andro",{name} (Direkt)')
-        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-        out.append(f'#EXTVLCOPT:http-referrer={REF_ANDRO}')
-        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_ANDRO}"}}')
-        out.append(real_url)
-
-    # ---------------- HTML LİSTESİ ----------------
-    for c in HTML_LIST:
-        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
-        real_url = URL_HTML.format(c['id'])
-        
-        # 1. Proxy Linki
-        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_HTML}"
-        out.append(f'#EXTINF:-1 group-title="HTML",{name}')
-        out.append(p_url)
-
-        # 2. Direkt Link (Headerlı)
-        out.append(f'#EXTINF:-1 group-title="HTML",{name} (Direkt)')
-        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-        out.append(f'#EXTVLCOPT:http-referrer={REF_HTML}')
-        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_HTML}"}}')
-        out.append(real_url)
-
-    # ---------------- FIXED LİSTESİ ----------------
-    for c in FIXED_LIST:
-        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
-        real_url = URL_FIXED.format(c['id'])
-        
-        # 1. Proxy Linki
-        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_FIXED}"
-        out.append(f'#EXTINF:-1 group-title="Fixed",{name}')
-        out.append(p_url)
-
-        # 2. Direkt Link (Headerlı)
-        out.append(f'#EXTINF:-1 group-title="Fixed",{name} (Direkt)')
-        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-        out.append(f'#EXTVLCOPT:http-referrer={REF_FIXED}')
-        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_FIXED}"}}')
-        out.append(real_url)
-
-    # ---------------- VAVOO LİSTESİ ----------------
+    # VAVOO
     try:
-        r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=5)
-        v_data = r.json()
-        for i in v_data:
-            if i.get("group") == "Turkey":
-                try:
-                    raw_url = i['url']
-                    if '/play/' in raw_url:
-                        cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
-                        
-                        name = i["name"].replace(",", " ")
-                        name = re.sub(r'\s*\(\d+\)', '', name).strip()
-
-                        v_real_url = URL_VAVOO.format(cid)
-
-                        # 1. Proxy Linki
-                        p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
-                        out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
-                        out.append(p_url)
-
-                        # 2. Direkt Link (Headerlı)
-                        out.append(f'#EXTINF:-1 group-title="Vavoo",{name} (Direkt)')
-                        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-                        out.append(f'#EXTVLCOPT:http-referrer={REF_VAVOO}')
-                        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_VAVOO}"}}')
-                        out.append(v_real_url)
-                except: pass
-    except: pass
+        r = session.get(f"{SOURCE_VAVOO}/live2/index", timeout=5, verify=False)
+        for i in r.json():
+            if i.get("group") == "Turkey" and "/play/" in i.get("url",""):
+                cid = i["url"].split("/play/")[1].split("/")[0]
+                name = re.sub(r'\s*\(\d+\)', '', i["name"]).replace(",", " ")
+                real = URL_VAVOO.format(cid)
+                out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
+                out.append(f'{host}/api/m3u8?u={real}&r={REF_VAVOO}')
+    except:
+        pass
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
+# ================== M3U8 ==================
 @app.route('/api/m3u8')
 def api_m3u8():
-    target_url = request.args.get('u')
-    referer = request.args.get('r')
-    
-    if not target_url: return Response("No URL", 400)
+    target = request.args.get('u')
+    ref = request.args.get('r')
+    if not target:
+        return Response("No URL", 400)
 
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        if referer: headers["Referer"] = referer
+    h = {"User-Agent": USER_AGENT}
+    if ref: h["Referer"] = ref
 
-        r = session.get(target_url, headers=headers, verify=False, timeout=10)
-        if r.status_code != 200:
-            return Response(f"Source Error: {r.status_code}", status=r.status_code)
+    r = session.get(target, headers=h, timeout=10, verify=False)
 
-        if "EXT-X-STREAM-INF" in r.text:
-            lines = r.text.splitlines()
-            best_url = None
-            max_bw = 0
-            
-            for i, line in enumerate(lines):
-                if "#EXT-X-STREAM-INF" in line:
-                    bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                    bw = int(bw_match.group(1)) if bw_match else 0
-                    
-                    if bw > max_bw:
-                        max_bw = bw
-                        if i + 1 < len(lines):
-                            potential_url = lines[i+1].strip()
-                            if potential_url and not potential_url.startswith('#'):
-                                best_url = potential_url
+    if "EXT-X-STREAM-INF" in r.text:
+        best, bw = None, 0
+        l = r.text.splitlines()
+        for i, line in enumerate(l):
+            if "EXT-X-STREAM-INF" in line:
+                m = re.search(r'BANDWIDTH=(\d+)', line)
+                v = int(m.group(1)) if m else 0
+                if v > bw and i+1 < len(l):
+                    bw, best = v, l[i+1].strip()
+        if best:
+            base = r.url.rsplit('/',1)[0]
+            target = best if best.startswith('http') else f"{base}/{best}"
+            r = session.get(target, headers=h, timeout=10, verify=False)
 
-            if best_url:
-                if not best_url.startswith('http'):
-                    base_temp = r.url.rsplit('/', 1)[0]
-                    target_url = f"{base_temp}/{best_url}"
-                else:
-                    target_url = best_url
-                
-                r = session.get(target_url, headers=headers, verify=False, timeout=10)
+    base = r.url.rsplit('/',1)[0]
+    host = request.host_url.rstrip('/')
+    out = []
 
-        final_url = r.url
-        base_url = final_url.rsplit('/', 1)[0]
-        host = request.host_url.rstrip('/')
+    for line in r.text.splitlines():
+        if not line or line.startswith('#'):
+            out.append(line)
+        else:
+            full = line if line.startswith('http') else f"{base}/{line}"
+            ts = f"{host}/api/ts?u={full}"
+            if ref: ts += f"&r={ref}"
+            out.append(ts)
 
-        new_lines = []
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line: continue
-            
-            if line.startswith('#'):
-                new_lines.append(line)
-            else:
-                if line.startswith('http'):
-                    full_ts_url = line
-                else:
-                    full_ts_url = f"{base_url}/{line}"
-                
-                proxy_ts_link = f"{host}/api/ts?u={full_ts_url}"
-                if referer:
-                    proxy_ts_link += f"&r={referer}"
-                
-                new_lines.append(proxy_ts_link)
+    return Response("\n".join(out), content_type="application/vnd.apple.mpegurl")
 
-        return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
-
-    except Exception as e:
-        return Response(str(e), 500)
-
+# ================== TS ==================
 @app.route('/api/ts')
 def api_ts():
-    target_url = request.args.get('u')
-    referer = request.args.get('r')
+    u = request.args.get('u')
+    rfr = request.args.get('r')
+    if not u:
+        return Response("No URL", 400)
 
-    if not target_url: return Response("No URL", 400)
+    h = {"User-Agent": USER_AGENT}
+    if rfr: h["Referer"] = rfr
 
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        if referer: headers["Referer"] = referer
+    r = session.get(u, headers=h, stream=True, verify=False, timeout=(5, None))
 
-        r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=15)
-        
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        headers = [(name, value) for (name, value) in r.headers.items()
-                   if name.lower() not in excluded_headers]
+    def gen():
+        for c in r.iter_content(chunk_size=CHUNK_SIZE):
+            if c:
+                yield c
+                sleep(0)
 
-        def generate():
-            for chunk in r.iter_content(chunk_size=4096): 
-                if chunk:
-                    yield chunk
+    return Response(
+        stream_with_context(gen()),
+        headers=[("Content-Type", "video/mp2t")],
+        status=r.status_code
+    )
 
-        return Response(stream_with_context(generate()), headers=headers, status=r.status_code)
-
-    except Exception as e:
-        return Response(str(e), 500)
-
+# ================== START ==================
 if __name__ == "__main__":
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
