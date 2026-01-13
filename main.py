@@ -7,7 +7,7 @@ from gevent.pywsgi import WSGIServer
 from gevent import sleep
 from flask import Flask, Response, request, stream_with_context
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 PORT = 8080
 CHUNK_SIZE = 16384
 
@@ -32,7 +32,7 @@ urllib3.disable_warnings()
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# ================== SESSION ==================
+# ================= SESSION =================
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
@@ -53,7 +53,7 @@ adapter = HTTPAdapter(
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# ================== CHANNEL LISTS ==================
+# ================= CHANNEL LISTS =================
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
@@ -173,50 +173,58 @@ FIXED_LIST = [
     {"name":"Tabii Spor 6 (Sabit)","id":"yayinex6"},
 ]
 
-# ================== ROOT ==================
+# ================= ROOT (M3U) =================
 @app.route('/')
 def root():
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
 
-    for lst, url_tpl, ref, grp in [
-        (ANDRO_LIST, URL_ANDRO, REF_ANDRO, "Andro"),
-        (HTML_LIST,  URL_HTML,  REF_HTML,  "HTML"),
-        (FIXED_LIST, URL_FIXED, REF_FIXED, "Fixed"),
-    ]:
-        for c in lst:
-            name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
-            real = url_tpl.format(c['id'])
-            out.append(f'#EXTINF:-1 group-title="{grp}",{name}')
-            out.append(f'{host}/api/m3u8?u={real}&r={ref}')
+    def add_channel(group, name, real_url, ref):
+        # Proxy
+        out.append(f'#EXTINF:-1 group-title="{group}",{name}')
+        out.append(f'{host}/api/m3u8?u={real_url}&r={ref}')
+        # Direkt (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="{group}",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={ref}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{ref}"}}')
+        out.append(real_url)
 
-    # VAVOO
+    for c in ANDRO_LIST:
+        add_channel("Andro", c["name"], URL_ANDRO.format(c["id"]), REF_ANDRO)
+
+    for c in HTML_LIST:
+        name = re.sub(r'\s*\(.*?\)', '', c["name"])
+        add_channel("HTML", name, URL_HTML.format(c["id"]), REF_HTML)
+
+    for c in FIXED_LIST:
+        name = re.sub(r'\s*\(.*?\)', '', c["name"])
+        add_channel("Fixed", name, URL_FIXED.format(c["id"]), REF_FIXED)
+
     try:
         r = session.get(f"{SOURCE_VAVOO}/live2/index", timeout=5, verify=False)
         for i in r.json():
             if i.get("group") == "Turkey" and "/play/" in i.get("url",""):
                 cid = i["url"].split("/play/")[1].split("/")[0]
                 name = re.sub(r'\s*\(\d+\)', '', i["name"]).replace(",", " ")
-                real = URL_VAVOO.format(cid)
-                out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
-                out.append(f'{host}/api/m3u8?u={real}&r={REF_VAVOO}')
+                add_channel("Vavoo", name, URL_VAVOO.format(cid), REF_VAVOO)
     except:
         pass
 
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
-# ================== M3U8 ==================
+# ================= M3U8 PROXY =================
 @app.route('/api/m3u8')
 def api_m3u8():
-    target = request.args.get('u')
-    ref = request.args.get('r')
-    if not target:
+    u = request.args.get('u')
+    rfr = request.args.get('r')
+    if not u:
         return Response("No URL", 400)
 
     h = {"User-Agent": USER_AGENT}
-    if ref: h["Referer"] = ref
+    if rfr: h["Referer"] = rfr
 
-    r = session.get(target, headers=h, timeout=10, verify=False)
+    r = session.get(u, headers=h, timeout=10, verify=False)
 
     if "EXT-X-STREAM-INF" in r.text:
         best, bw = None, 0
@@ -229,8 +237,8 @@ def api_m3u8():
                     bw, best = v, l[i+1].strip()
         if best:
             base = r.url.rsplit('/',1)[0]
-            target = best if best.startswith('http') else f"{base}/{best}"
-            r = session.get(target, headers=h, timeout=10, verify=False)
+            u = best if best.startswith('http') else f"{base}/{best}"
+            r = session.get(u, headers=h, timeout=10, verify=False)
 
     base = r.url.rsplit('/',1)[0]
     host = request.host_url.rstrip('/')
@@ -242,12 +250,12 @@ def api_m3u8():
         else:
             full = line if line.startswith('http') else f"{base}/{line}"
             ts = f"{host}/api/ts?u={full}"
-            if ref: ts += f"&r={ref}"
+            if rfr: ts += f"&r={rfr}"
             out.append(ts)
 
     return Response("\n".join(out), content_type="application/vnd.apple.mpegurl")
 
-# ================== TS ==================
+# ================= TS PROXY =================
 @app.route('/api/ts')
 def api_ts():
     u = request.args.get('u')
@@ -268,10 +276,10 @@ def api_ts():
 
     return Response(
         stream_with_context(gen()),
-        headers=[("Content-Type", "video/mp2t")],
+        headers=[("Content-Type","video/mp2t")],
         status=r.status_code
     )
 
-# ================== START ==================
+# ================= START =================
 if __name__ == "__main__":
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
