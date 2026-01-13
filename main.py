@@ -165,30 +165,58 @@ def root():
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
 
+    # ---------------- ANDRO LİSTESİ ----------------
     for c in ANDRO_LIST:
-        # Andro listesinde isim temizliği (Genel)
         name = c["name"]
         real_url = URL_ANDRO.format(c['id'])
+        
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_ANDRO}"
         out.append(f'#EXTINF:-1 group-title="Andro",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="Andro",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_ANDRO}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_ANDRO}"}}')
+        out.append(real_url)
+
+    # ---------------- HTML LİSTESİ ----------------
     for c in HTML_LIST:
-        # HTML listesi temizliği: (Alt) ve benzeri parantezleri siler
         name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_HTML.format(c['id'])
+        
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_HTML}"
         out.append(f'#EXTINF:-1 group-title="HTML",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="HTML",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_HTML}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_HTML}"}}')
+        out.append(real_url)
+
+    # ---------------- FIXED LİSTESİ ----------------
     for c in FIXED_LIST:
-        # Fixed listesi temizliği: (Sabit) ve benzeri parantezleri siler
         name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         real_url = URL_FIXED.format(c['id'])
+        
+        # 1. Proxy Linki
         p_url = f"{host}/api/m3u8?u={real_url}&r={REF_FIXED}"
         out.append(f'#EXTINF:-1 group-title="Fixed",{name}')
         out.append(p_url)
 
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="Fixed",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_FIXED}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_FIXED}"}}')
+        out.append(real_url)
+
+    # ---------------- VAVOO LİSTESİ ----------------
     try:
         r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=5)
         v_data = r.json()
@@ -199,15 +227,23 @@ def root():
                     if '/play/' in raw_url:
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                         
-                        # VAVOO İsim Temizliği
+                        # İsim Temizliği
                         name = i["name"].replace(",", " ")
-                        # (1), (7), (23) gibi ifadeleri siler
                         name = re.sub(r'\s*\(\d+\)', '', name).strip()
 
                         v_real_url = URL_VAVOO.format(cid)
+
+                        # 1. Proxy Linki
                         p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
                         out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
                         out.append(p_url)
+
+                        # 2. Direkt Link (Headerlı)
+                        out.append(f'#EXTINF:-1 group-title="Vavoo",{name} (Direkt)')
+                        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+                        out.append(f'#EXTVLCOPT:http-referrer={REF_VAVOO}')
+                        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_VAVOO}"}}')
+                        out.append(v_real_url)
                 except: pass
     except: pass
 
