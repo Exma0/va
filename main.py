@@ -15,35 +15,59 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
-# Global Cache: {cid: {'time': timestamp, 'url': base_url, 'content': m3u8_text}}
+# Global Cache Yapısı: 
+# {cid: {'time': timestamp, 'map': {filename: full_url}, 'raw_m3u8': text}}
 m3u8_cache = {}
 
-def get_fresh_m3u8(cid):
+def parse_m3u8_to_map(base_url, content):
     """
-    Kanalın en güncel m3u8 verisini çeker. 
-    Eğer 2 saniye içinde çekilmişse hafızadan verir (Hız ve engellenmemek için).
+    M3U8 içeriğini tarar ve dosya isimlerini anahtar, tam URL'leri değer olarak bir sözlüğe atar.
+    Bu işlem arama hızını O(n)'den O(1)'e düşürür.
+    """
+    segment_map = {}
+    lines = content.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        
+        # Dosya ismini URL'den ayıkla (query parametrelerini atarak)
+        # Örn: segment_1.ts?token=xyz -> segment_1.ts
+        full_url = line if line.startswith('http') else f"{base_url}/{line}"
+        
+        # Sadece dosya ismini al (token öncesi)
+        filename = line.split('/')[-1].split('?')[0]
+        segment_map[filename] = full_url
+        
+    return segment_map
+
+def get_fresh_m3u8(cid, force_refresh=False):
+    """
+    Kanalın verisini çeker ve parse edilmiş haritayı döndürür.
     """
     now = time.time()
-    if cid in m3u8_cache and (now - m3u8_cache[cid]['time'] < 2.0):
-        return m3u8_cache[cid]['url'], m3u8_cache[cid]['content']
+    
+    # Eğer zorla yenileme istenmemişse ve veri yeniyse cache'den dön
+    if not force_refresh and cid in m3u8_cache and (now - m3u8_cache[cid]['time'] < 4.0): # Süreyi 4sn yaptım, Vavoo segmentleri 10sn sürer
+        return m3u8_cache[cid]['map'], m3u8_cache[cid]['raw_m3u8']
 
     try:
-        # Vavoo bazen POST bazen GET ister ama genellikle play/{id}/index.m3u8 çalışır
-        # Redirectleri takip eder (allow_redirects=True defaulttur)
         r = session.get(f"{SOURCE}/play/{cid}/index.m3u8", verify=False, timeout=5)
         if r.status_code == 200:
-            # Redirect sonrası asıl base URL'yi al
             base_url = r.url.rsplit('/', 1)[0]
             content = r.text
-            m3u8_cache[cid] = {'time': now, 'url': base_url, 'content': content}
-            return base_url, content
+            
+            # PARSE İŞLEMİNİ BURADA BİR KERE YAPIYORUZ
+            seg_map = parse_m3u8_to_map(base_url, content)
+            
+            m3u8_cache[cid] = {'time': now, 'map': seg_map, 'raw_m3u8': content}
+            return seg_map, content
     except Exception as e:
-        print(f"Update Error: {e}")
+        print(f"Update Error ({cid}): {e}")
+    
     return None, None
 
 def proxy_req(url):
     try:
-        # Stream=True ile veriyi parça parça aktar
         r = session.get(url, stream=True, verify=False, timeout=10)
         if r.status_code == 200:
             return Response(stream_with_context(r.iter_content(chunk_size=8192)), content_type="video/mp2t")
@@ -55,25 +79,22 @@ def proxy_req(url):
 @app.route('/')
 def root():
     try:
-        r = session.get(f"{SOURCE}/live2/index", verify=False, timeout=5)
+        # Liste çekme işlemi de bazen zaman aşımına uğrayabilir, try-except kalsın
+        r = session.get(f"{SOURCE}/live2/index", verify=False, timeout=8)
         data = r.json()
-    except: return Response("Source Error", 503)
+    except: return Response("Source Error or Timeout", 503)
     
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
     
-    # Sadece Türkiye grubunu filtrele
     for i in data:
         if i.get("group") == "Turkey":
             try:
-                # URL yapısından CID'yi temizle
                 raw_url = i['url']
-                # Genelde url şöyledir: http://.../play/123456/index.m3u8
                 if '/play/' in raw_url:
                     cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
                     name = i["name"].replace(",", " ")
                     out.append(f'#EXTINF:-1 group-title="Turkey",{name}')
-                    # Bizim sunucuya yönlendir
                     out.append(f"{host}/live/{cid}.m3u8")
             except: pass
             
@@ -81,14 +102,14 @@ def root():
 
 @app.route('/live/<cid>.m3u8')
 def m3u8_endpoint(cid):
-    base_url, content = get_fresh_m3u8(cid)
+    # force_refresh=False ile çağırıyoruz
+    seg_map, content = get_fresh_m3u8(cid)
     if not content:
         return Response("Stream Not Found", 404)
 
     host = request.host_url.rstrip('/')
     out = []
     
-    # Satır satır işle
     for line in content.splitlines():
         line = line.strip()
         if not line: continue
@@ -96,13 +117,12 @@ def m3u8_endpoint(cid):
         if line.startswith('#'):
             out.append(line)
         else:
-            # Burası TS dosyasıdır.
-            # Eski yöntem: URL'yi şifreleyip gönderiyorduk (Link ölüyordu).
-            # Yeni yöntem: Sadece dosya ismini ve CID'yi gönderiyoruz.
-            # TS dosyasının adı genellikle unique'dir veya sıralıdır.
-            ts_filename = line.split('/')[-1] # örn: segment_150.ts veya tokenli_uzun_isim.ts
+            # TS dosyasının adını al (token kısmını at)
+            # Vavoo'da bazen index.m3u8 içinde de tokenli url döner, temizleyip sadece dosya ismini alalım
+            raw_filename = line.split('/')[-1]
+            ts_filename = raw_filename.split('?')[0] # Query string varsa temizle
             
-            # Client'a bizim TS endpointimizi veriyoruz, CID ve dosya ismini parametre geçiyoruz
+            # Client'a temiz isim gönderiyoruz
             new_link = f"{host}/ts?cid={cid}&file={ts_filename}"
             out.append(new_link)
 
@@ -110,52 +130,31 @@ def m3u8_endpoint(cid):
 
 @app.route('/ts')
 def ts_endpoint():
-    # Bu endpoint her çağrıldığında GÜNCEL linki bulur.
     cid = request.args.get('cid')
     filename = request.args.get('file')
     
     if not cid or not filename:
         return Response("Bad Request", 400)
 
-    # 1. Adım: Kanalın en son m3u8'ini hafızadan veya netten çek
-    base_url, content = get_fresh_m3u8(cid)
-    if not base_url:
-        return Response("Stream Lost", 404)
-
-    # 2. Adım: İstenen dosyayı m3u8 içinde ara ve gerçek URL'sini bul
+    # 1. Adım: Cache'deki haritaya bak
+    seg_map, _ = get_fresh_m3u8(cid, force_refresh=False)
+    
     target_url = None
-    
-    # Hızlı eşleşme için satırları tara
-    lines = content.splitlines()
-    for line in lines:
-        if filename in line: # Dosya ismini içeren satırı bulduk
-            line = line.strip()
-            if line.startswith('http'):
-                target_url = line
-            else:
-                target_url = f"{base_url}/{line}"
-            break
-    
-    # Eğer o anki m3u8'de yoksa, belki liste yenilendi, bir şans daha verip taze çekelim (force refresh)
-    if not target_url:
-         # Cache'i bypass edip zorla yenile
-        if cid in m3u8_cache: del m3u8_cache[cid] 
-        base_url, content = get_fresh_m3u8(cid)
-        if content:
-             for line in content.splitlines():
-                if filename in line:
-                    line = line.strip()
-                    if line.startswith('http'):
-                        target_url = line
-                    else:
-                        target_url = f"{base_url}/{line}"
-                    break
+    if seg_map:
+        target_url = seg_map.get(filename)
 
-    # 3. Adım: Bulduysak indirip yayınla
+    # 2. Adım: Eğer haritada yoksa, yayın ilerlemiş olabilir. ZORLA YENİLE (Force Refresh)
+    if not target_url:
+        # print(f"Segment {filename} cache'de yok, yenileniyor...")
+        seg_map, _ = get_fresh_m3u8(cid, force_refresh=True)
+        if seg_map:
+            target_url = seg_map.get(filename)
+
+    # 3. Adım: Proxy
     if target_url:
         return proxy_req(target_url)
     else:
-        return Response("Segment expired or not found", 404)
+        return Response("Segment expired", 404)
 
 if __name__ == "__main__":
     print(f"Yayın sunucusu {PORT} portunda başlatıldı...")
