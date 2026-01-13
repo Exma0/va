@@ -1,19 +1,12 @@
 from gevent import monkey; monkey.patch_all()
-import requests, urllib3, logging, re, time
+import requests, urllib3, logging, re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
 from flask import Flask, Response, request, stream_with_context
-from urllib.parse import urljoin
 
-# ---------------- AYARLAR ----------------
 PORT = 8080
-CHUNK_SIZE = 32768
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
-# AKILLI LİNK HAVUZU (Database gibi çalışır)
-# Link patlarsa yenisini buraya yazarız.
-CDN_CACHE = {} 
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # REFERANS ADRESLERİ
 REF_ANDRO = 'https://taraftarium.is/'
@@ -32,19 +25,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# Performanslı Session Ayarları
 session = requests.Session()
-session.headers.update({
-    "User-Agent": USER_AGENT,
-    "Connection": "keep-alive"
-})
+session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
 retry_strategy = Retry(
-    total=2,
+    total=3,
     backoff_factor=0.1,
     status_forcelist=[500, 502, 503, 504],
 )
-
 adapter = HTTPAdapter(
     pool_connections=200,
     pool_maxsize=200,
@@ -54,7 +42,6 @@ adapter = HTTPAdapter(
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# ---------------- LİSTELER ----------------
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
@@ -179,26 +166,58 @@ def root():
     host = request.host_url.rstrip('/')
     out = ["#EXTM3U"]
 
-    def add_channel(name, real_url, referer, group):
-        p_url = f"{host}/api/m3u8?u={real_url}&r={referer}"
-        out.append(f'#EXTINF:-1 group-title="{group}",{name}')
+    # ---------------- ANDRO LİSTESİ ----------------
+    for c in ANDRO_LIST:
+        name = c["name"]
+        real_url = URL_ANDRO.format(c['id'])
+        
+        # 1. Proxy Linki
+        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_ANDRO}"
+        out.append(f'#EXTINF:-1 group-title="Andro",{name}')
         out.append(p_url)
 
-    # ANDRO
-    for c in ANDRO_LIST:
-        add_channel(c["name"], URL_ANDRO.format(c['id']), REF_ANDRO, "Andro")
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="Andro",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_ANDRO}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_ANDRO}"}}')
+        out.append(real_url)
 
-    # HTML
+    # ---------------- HTML LİSTESİ ----------------
     for c in HTML_LIST:
-        clean_name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
-        add_channel(clean_name, URL_HTML.format(c['id']), REF_HTML, "HTML")
+        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
+        real_url = URL_HTML.format(c['id'])
+        
+        # 1. Proxy Linki
+        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_HTML}"
+        out.append(f'#EXTINF:-1 group-title="HTML",{name}')
+        out.append(p_url)
 
-    # FIXED
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="HTML",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_HTML}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_HTML}"}}')
+        out.append(real_url)
+
+    # ---------------- FIXED LİSTESİ ----------------
     for c in FIXED_LIST:
-        clean_name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
-        add_channel(clean_name, URL_FIXED.format(c['id']), REF_FIXED, "Fixed")
+        name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
+        real_url = URL_FIXED.format(c['id'])
+        
+        # 1. Proxy Linki
+        p_url = f"{host}/api/m3u8?u={real_url}&r={REF_FIXED}"
+        out.append(f'#EXTINF:-1 group-title="Fixed",{name}')
+        out.append(p_url)
 
-    # VAVOO - Dinamik Tarama
+        # 2. Direkt Link (Headerlı)
+        out.append(f'#EXTINF:-1 group-title="Fixed",{name} (Direkt)')
+        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+        out.append(f'#EXTVLCOPT:http-referrer={REF_FIXED}')
+        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_FIXED}"}}')
+        out.append(real_url)
+
+    # ---------------- VAVOO LİSTESİ ----------------
     try:
         r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=5)
         v_data = r.json()
@@ -208,10 +227,23 @@ def root():
                     raw_url = i['url']
                     if '/play/' in raw_url:
                         cid = raw_url.split('/play/', 1)[1].split('/', 1)[0].replace('.m3u8', '')
-                        name = i["name"].replace(",", " ").strip()
+                        
+                        name = i["name"].replace(",", " ")
                         name = re.sub(r'\s*\(\d+\)', '', name).strip()
+
                         v_real_url = URL_VAVOO.format(cid)
-                        add_channel(name, v_real_url, REF_VAVOO, "Vavoo")
+
+                        # 1. Proxy Linki
+                        p_url = f"{host}/api/m3u8?u={v_real_url}&r={REF_VAVOO}"
+                        out.append(f'#EXTINF:-1 group-title="Vavoo",{name}')
+                        out.append(p_url)
+
+                        # 2. Direkt Link (Headerlı)
+                        out.append(f'#EXTINF:-1 group-title="Vavoo",{name} (Direkt)')
+                        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
+                        out.append(f'#EXTVLCOPT:http-referrer={REF_VAVOO}')
+                        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{REF_VAVOO}"}}')
+                        out.append(v_real_url)
                 except: pass
     except: pass
 
@@ -219,64 +251,19 @@ def root():
 
 @app.route('/api/m3u8')
 def api_m3u8():
-    # Bu fonksiyon "Merkez Üs" görevi görür.
-    # Oynatıcı her 5-10 saniyede bir buraya gelir.
-    
-    original_url = request.args.get('u')
+    target_url = request.args.get('u')
     referer = request.args.get('r')
     
-    if not original_url: return Response("No URL", 400)
+    if not target_url: return Response("No URL", 400)
 
     try:
         headers = {"User-Agent": USER_AGENT}
         if referer: headers["Referer"] = referer
 
-        # -------------------------------------------------------------
-        # AKILLI LINK YENİLEME SİSTEMİ (SELF-HEALING)
-        # -------------------------------------------------------------
-        target_url = original_url
-        
-        # 1. Eğer hafızada çalışan bir CDN linki varsa onu dene
-        if original_url in CDN_CACHE:
-            target_url = CDN_CACHE[original_url]
-        
-        # 2. Linki çekmeyi dene
-        r = session.get(target_url, headers=headers, verify=False, timeout=8)
-
-        # 3. Eğer hafızadaki link hata verdiyse (403 Forbidden / 404 Not Found)
-        # Demek ki linkin süresi dolmuş. HEMEN ORJİNALİNDEN YENİSİNİ AL.
-        if r.status_code >= 400 and target_url != original_url:
-            # "Link ölmüş, yenisini alıyorum..."
-            r = session.get(original_url, headers=headers, verify=False, timeout=8)
-            
-            # Yeni linki hafızaya at (Bir sonraki istekte bunu kullanalım)
-            if r.status_code == 200:
-                 CDN_CACHE[original_url] = r.url
-
-        # Vavoo JSON koruması
-        try:
-            if "application/json" in r.headers.get("Content-Type", ""):
-                json_data = r.json()
-                if "url" in json_data:
-                    target_url = json_data["url"]
-                    r = session.get(target_url, headers=headers, verify=False, timeout=8)
-                    if r.status_code == 200:
-                        CDN_CACHE[original_url] = r.url
-        except: pass
-
+        r = session.get(target_url, headers=headers, verify=False, timeout=10)
         if r.status_code != 200:
             return Response(f"Source Error: {r.status_code}", status=r.status_code)
-        
-        # CDN Linki güncellendiyse (ve ilk deneme değilse) cache'e yaz
-        if r.url != original_url and r.url != target_url:
-             CDN_CACHE[original_url] = r.url
 
-        # -------------------------------------------------------------
-
-        base_url = r.url.rsplit('/', 1)[0]
-        final_text = r.text
-
-        # Master Playlist Çözümleme
         if "EXT-X-STREAM-INF" in r.text:
             lines = r.text.splitlines()
             best_url = None
@@ -286,34 +273,44 @@ def api_m3u8():
                 if "#EXT-X-STREAM-INF" in line:
                     bw_match = re.search(r'BANDWIDTH=(\d+)', line)
                     bw = int(bw_match.group(1)) if bw_match else 0
+                    
                     if bw > max_bw:
                         max_bw = bw
                         if i + 1 < len(lines):
                             potential_url = lines[i+1].strip()
                             if potential_url and not potential_url.startswith('#'):
-                                best_url = urljoin(r.url, potential_url)
+                                best_url = potential_url
 
             if best_url:
-                target_url = best_url
-                r = session.get(target_url, headers=headers, verify=False, timeout=8)
-                base_url = r.url.rsplit('/', 1)[0]
-                final_text = r.text
+                if not best_url.startswith('http'):
+                    base_temp = r.url.rsplit('/', 1)[0]
+                    target_url = f"{base_temp}/{best_url}"
+                else:
+                    target_url = best_url
+                
+                r = session.get(target_url, headers=headers, verify=False, timeout=10)
 
-        # Proxy Link Oluşturma
+        final_url = r.url
+        base_url = final_url.rsplit('/', 1)[0]
         host = request.host_url.rstrip('/')
+
         new_lines = []
-        
-        for line in final_text.splitlines():
+        for line in r.text.splitlines():
             line = line.strip()
             if not line: continue
             
             if line.startswith('#'):
                 new_lines.append(line)
             else:
-                full_ts_url = urljoin(base_url + '/', line)
+                if line.startswith('http'):
+                    full_ts_url = line
+                else:
+                    full_ts_url = f"{base_url}/{line}"
+                
                 proxy_ts_link = f"{host}/api/ts?u={full_ts_url}"
                 if referer:
                     proxy_ts_link += f"&r={referer}"
+                
                 new_lines.append(proxy_ts_link)
 
         return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
@@ -329,27 +326,24 @@ def api_ts():
     if not target_url: return Response("No URL", 400)
 
     try:
-        req_headers = {key: value for (key, value) in request.headers if key != 'Host'}
-        req_headers['User-Agent'] = USER_AGENT
-        if referer: 
-            req_headers['Referer'] = referer
-        else:
-            req_headers['Referer'] = "https://vavoo.to/"
+        headers = {"User-Agent": USER_AGENT}
+        if referer: headers["Referer"] = referer
 
-        with session.get(target_url, headers=req_headers, stream=True, verify=False, timeout=(3.05, 30)) as r:
-            excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-            headers = [(name, value) for (name, value) in r.headers.items()
-                       if name.lower() not in excluded_headers]
+        r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=15)
+        
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        headers = [(name, value) for (name, value) in r.headers.items()
+                   if name.lower() not in excluded_headers]
 
-            def generate():
-                for chunk in r.iter_content(chunk_size=CHUNK_SIZE): 
-                    if chunk:
-                        yield chunk
+        def generate():
+            for chunk in r.iter_content(chunk_size=16384): 
+                if chunk:
+                    yield chunk
 
-            return Response(stream_with_context(generate()), headers=headers, status=r.status_code)
+        return Response(stream_with_context(generate()), headers=headers, status=r.status_code)
 
     except Exception as e:
-        return Response("Stream Error", 500)
+        return Response(str(e), 500)
 
 if __name__ == "__main__":
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
