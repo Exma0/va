@@ -31,7 +31,7 @@ session.headers.update({"User-Agent": USER_AGENT})
 # 1. TAM LİSTE: ANDRO KANALLARI (PHP'den Birebir)
 # ==============================================================================
 ANDRO_LIST = [
-    {'name':'BeIN Sports 1','id':'androstreamlivebs1'},
+    {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
     {'name':'BeIN Sports 3','id':'androstreamlivebs3'},
     {'name':'BeIN Sports 4','id':'androstreamlivebs4'},
