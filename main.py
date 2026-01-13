@@ -214,43 +214,31 @@ def api_m3u8():
         if r.status_code != 200:
             return Response(f"Source Error: {r.status_code}", status=r.status_code)
 
-        # ----------------------------------------------------------------------
-        # EN YÜKSEK KALİTE SEÇİM MANTIĞI (AUTO-BEST QUALITY)
-        # ----------------------------------------------------------------------
         if "EXT-X-STREAM-INF" in r.text:
             lines = r.text.splitlines()
             best_url = None
             max_bw = 0
             
-            # Tüm varyasyonları tara
             for i, line in enumerate(lines):
                 if "#EXT-X-STREAM-INF" in line:
-                    # BANDWIDTH değerini yakala
                     bw_match = re.search(r'BANDWIDTH=(\d+)', line)
                     bw = int(bw_match.group(1)) if bw_match else 0
                     
-                    # Eğer bu kalite daha yüksekse, bunu seç
                     if bw > max_bw:
                         max_bw = bw
-                        # URL genellikle bir alt satırdadır
                         if i + 1 < len(lines):
                             potential_url = lines[i+1].strip()
                             if potential_url and not potential_url.startswith('#'):
                                 best_url = potential_url
 
-            # Eğer daha iyi bir kalite linki bulduysak, hedefi güncelle
             if best_url:
-                # Relative URL kontrolü (http ile başlamıyorsa base_url ekle)
                 if not best_url.startswith('http'):
                     base_temp = r.url.rsplit('/', 1)[0]
                     target_url = f"{base_temp}/{best_url}"
                 else:
                     target_url = best_url
                 
-                # Yeni yüksek kalite linkini tekrar çek
                 r = session.get(target_url, headers=headers, verify=False, timeout=10)
-
-        # ----------------------------------------------------------------------
 
         final_url = r.url
         base_url = final_url.rsplit('/', 1)[0]
