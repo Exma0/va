@@ -1,5 +1,5 @@
 from gevent import monkey; monkey.patch_all()
-import requests, urllib3, logging, re
+import requests, urllib3, logging, re, time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
@@ -8,9 +8,12 @@ from urllib.parse import urljoin
 
 # ---------------- AYARLAR ----------------
 PORT = 8080
-# Chunk size'ı biraz daha ufaltarak (16KB) tepki süresini hızlandırdık
-CHUNK_SIZE = 16384 
+CHUNK_SIZE = 32768
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+# AKILLI LİNK HAVUZU (Database gibi çalışır)
+# Link patlarsa yenisini buraya yazarız.
+CDN_CACHE = {} 
 
 # REFERANS ADRESLERİ
 REF_ANDRO = 'https://taraftarium.is/'
@@ -29,22 +32,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# Session nesnesi ile bağlantı havuzu oluşturuyoruz (Hızın Sırrı Burası)
+# Performanslı Session Ayarları
 session = requests.Session()
 session.headers.update({
     "User-Agent": USER_AGENT,
-    "Connection": "keep-alive", # Bağlantıyı koparma, açık tut
-    "Accept-Encoding": "gzip, deflate" # Sıkıştırma kullan
+    "Connection": "keep-alive"
 })
 
 retry_strategy = Retry(
-    total=3,
+    total=2,
     backoff_factor=0.1,
     status_forcelist=[500, 502, 503, 504],
 )
 
 adapter = HTTPAdapter(
-    pool_connections=200, # Aynı anda açık kalacak bağlantı sayısı
+    pool_connections=200,
     pool_maxsize=200,
     max_retries=retry_strategy,
     pool_block=False
@@ -52,7 +54,7 @@ adapter = HTTPAdapter(
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# ---------------- LİSTELER (Aynı Şekilde Korundu) ----------------
+# ---------------- LİSTELER ----------------
 ANDRO_LIST = [
     {'name':'BeIN Sports 1','id':'receptestt'},
     {'name':'BeIN Sports 2','id':'androstreamlivebs2'},
@@ -182,21 +184,21 @@ def root():
         out.append(f'#EXTINF:-1 group-title="{group}",{name}')
         out.append(p_url)
 
-    # 1. ANDRO LİSTESİ
+    # ANDRO
     for c in ANDRO_LIST:
         add_channel(c["name"], URL_ANDRO.format(c['id']), REF_ANDRO, "Andro")
 
-    # 2. HTML LİSTESİ
+    # HTML
     for c in HTML_LIST:
         clean_name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         add_channel(clean_name, URL_HTML.format(c['id']), REF_HTML, "HTML")
 
-    # 3. FIXED LİSTESİ
+    # FIXED
     for c in FIXED_LIST:
         clean_name = re.sub(r'\s*\(.*?\)', '', c["name"]).strip()
         add_channel(clean_name, URL_FIXED.format(c['id']), REF_FIXED, "Fixed")
 
-    # 4. VAVOO LİSTESİ (Dinamik Tarama)
+    # VAVOO - Dinamik Tarama
     try:
         r = session.get(f"{SOURCE_VAVOO}/live2/index", verify=False, timeout=5)
         v_data = r.json()
@@ -217,36 +219,64 @@ def root():
 
 @app.route('/api/m3u8')
 def api_m3u8():
-    target_url = request.args.get('u')
+    # Bu fonksiyon "Merkez Üs" görevi görür.
+    # Oynatıcı her 5-10 saniyede bir buraya gelir.
+    
+    original_url = request.args.get('u')
     referer = request.args.get('r')
     
-    if not target_url: return Response("No URL", 400)
+    if not original_url: return Response("No URL", 400)
 
     try:
         headers = {"User-Agent": USER_AGENT}
         if referer: headers["Referer"] = referer
 
-        # Önbellek KULLANMADAN her seferinde taze link alıyoruz.
-        # Session havuzu sayesinde bu işlem artık çok hızlı.
-        r = session.get(target_url, headers=headers, verify=False, timeout=10)
+        # -------------------------------------------------------------
+        # AKILLI LINK YENİLEME SİSTEMİ (SELF-HEALING)
+        # -------------------------------------------------------------
+        target_url = original_url
         
-        if r.status_code != 200:
-            return Response(f"Source Error: {r.status_code}", status=r.status_code)
+        # 1. Eğer hafızada çalışan bir CDN linki varsa onu dene
+        if original_url in CDN_CACHE:
+            target_url = CDN_CACHE[original_url]
+        
+        # 2. Linki çekmeyi dene
+        r = session.get(target_url, headers=headers, verify=False, timeout=8)
 
-        # Vavoo bazen JSON döner (Önemli Düzeltme)
-        # Eğer cevap JSON ise içindeki "url"yi alıp tekrar istek atmalıyız
+        # 3. Eğer hafızadaki link hata verdiyse (403 Forbidden / 404 Not Found)
+        # Demek ki linkin süresi dolmuş. HEMEN ORJİNALİNDEN YENİSİNİ AL.
+        if r.status_code >= 400 and target_url != original_url:
+            # "Link ölmüş, yenisini alıyorum..."
+            r = session.get(original_url, headers=headers, verify=False, timeout=8)
+            
+            # Yeni linki hafızaya at (Bir sonraki istekte bunu kullanalım)
+            if r.status_code == 200:
+                 CDN_CACHE[original_url] = r.url
+
+        # Vavoo JSON koruması
         try:
             if "application/json" in r.headers.get("Content-Type", ""):
                 json_data = r.json()
                 if "url" in json_data:
                     target_url = json_data["url"]
-                    r = session.get(target_url, headers=headers, verify=False, timeout=10)
+                    r = session.get(target_url, headers=headers, verify=False, timeout=8)
+                    if r.status_code == 200:
+                        CDN_CACHE[original_url] = r.url
         except: pass
+
+        if r.status_code != 200:
+            return Response(f"Source Error: {r.status_code}", status=r.status_code)
+        
+        # CDN Linki güncellendiyse (ve ilk deneme değilse) cache'e yaz
+        if r.url != original_url and r.url != target_url:
+             CDN_CACHE[original_url] = r.url
+
+        # -------------------------------------------------------------
 
         base_url = r.url.rsplit('/', 1)[0]
         final_text = r.text
 
-        # 1. Master Playlist Çözümleme (En iyi kaliteyi bul)
+        # Master Playlist Çözümleme
         if "EXT-X-STREAM-INF" in r.text:
             lines = r.text.splitlines()
             best_url = None
@@ -265,11 +295,11 @@ def api_m3u8():
 
             if best_url:
                 target_url = best_url
-                r = session.get(target_url, headers=headers, verify=False, timeout=10)
+                r = session.get(target_url, headers=headers, verify=False, timeout=8)
                 base_url = r.url.rsplit('/', 1)[0]
                 final_text = r.text
 
-        # 2. Proxy Linklerini Oluştur
+        # Proxy Link Oluşturma
         host = request.host_url.rstrip('/')
         new_lines = []
         
@@ -280,10 +310,7 @@ def api_m3u8():
             if line.startswith('#'):
                 new_lines.append(line)
             else:
-                # TS dosyasının tam yolunu hesapla (Akıllı URL Birleştirme)
                 full_ts_url = urljoin(base_url + '/', line)
-                
-                # Proxy linkini oluştur
                 proxy_ts_link = f"{host}/api/ts?u={full_ts_url}"
                 if referer:
                     proxy_ts_link += f"&r={referer}"
@@ -302,27 +329,19 @@ def api_ts():
     if not target_url: return Response("No URL", 400)
 
     try:
-        # Headerları ayarla - Range desteği kritik
         req_headers = {key: value for (key, value) in request.headers if key != 'Host'}
         req_headers['User-Agent'] = USER_AGENT
-        
-        # Referer yönetimi: Vavoo linkleri bazen referer istemez, bazen ister.
-        # Fallback olarak kendi domainini gönderiyoruz.
         if referer: 
             req_headers['Referer'] = referer
         else:
             req_headers['Referer'] = "https://vavoo.to/"
 
-        # Bağlantıyı başlat (Stream mode)
-        with session.get(target_url, headers=req_headers, stream=True, verify=False, timeout=(3.05, 25)) as r:
-            
-            # Hop-by-hop headerları temizle
+        with session.get(target_url, headers=req_headers, stream=True, verify=False, timeout=(3.05, 30)) as r:
             excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             headers = [(name, value) for (name, value) in r.headers.items()
                        if name.lower() not in excluded_headers]
 
             def generate():
-                # 16KB (16384) paket boyutu donmaları minimize eder
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE): 
                     if chunk:
                         yield chunk
