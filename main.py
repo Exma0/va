@@ -282,7 +282,7 @@ def api_ts():
         r = session.get(target_url, headers=headers, stream=True, verify=False, timeout=10)
         
         return Response(
-            stream_with_context(r.iter_content(chunk_size=1)),
+            stream_with_context(r.iter_content(chunk_size=None)),
             content_type=r.headers.get('Content-Type', 'video/mp2t'),
             status=r.status_code
         )
