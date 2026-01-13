@@ -339,7 +339,7 @@ def api_ts():
         # CHUNK STREAMING JENERATÖRÜ
         def generate():
             # 8192 bytes (8KB) network dostu paket boyutudur
-            for chunk in r.iter_content(chunk_size=2192): 
+            for chunk in r.iter_content(chunk_size=8192): 
                 if chunk:
                     yield chunk
 
