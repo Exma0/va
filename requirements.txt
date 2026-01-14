@@ -4,3 +4,6 @@ gevent
 gunicorn
 urllib3
 ujson
+yt-dlp
+beautifulsoup4
+curl_cffi
