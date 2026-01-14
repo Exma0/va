@@ -19,7 +19,7 @@ USER_AGENT = (
 )
 
 REF_ANDRO = 'https://taraftarium.is/'
-REF_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/'
+REF_HTML  = 'https://inattv1212.xyz/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
 
 URL_ANDRO = 'https://andro.adece12.sbs/checklist/{}.m3u8'
