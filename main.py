@@ -19,7 +19,7 @@ USER_AGENT = (
 )
 
 REF_ANDRO = 'https://taraftarium.is/'
-REF_HTML  = 'https://inatspor35.xyz/'
+REF_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/'
 REF_FIXED = 'https://99d55c13ae7d1ebg.cfd/'
 REF_VAVOO = 'https://vavoo.to/'
 
