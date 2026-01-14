@@ -3,9 +3,7 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 import urllib.parse
 import re
-import yt_dlp
 import concurrent.futures
-import time
 
 app = Flask(__name__)
 
@@ -13,87 +11,104 @@ app = Flask(__name__)
 SITE_URL = "https://dizipal1219.com"
 PORT = 5000
 
+# Kaynaklar Listesi
 KAYNAKLAR = [
     {"ad": "Yeni Filmler", "url": f"{SITE_URL}/filmler", "tur": "Film"},
     {"ad": "Yeni Diziler", "url": f"{SITE_URL}/diziler", "tur": "Dizi"},
     {"ad": "Netflix", "url": f"{SITE_URL}/koleksiyon/netflix", "tur": "Platform"},
-    # Diğerlerini buraya ekleyebilirsin...
+    {"ad": "Exxen", "url": f"{SITE_URL}/koleksiyon/exxen", "tur": "Platform"},
+    {"ad": "BluTV", "url": f"{SITE_URL}/koleksiyon/blutv", "tur": "Platform"},
+    {"ad": "Disney+", "url": f"{SITE_URL}/koleksiyon/disney", "tur": "Platform"},
+    {"ad": "Amazon Prime", "url": f"{SITE_URL}/koleksiyon/amazon-prime", "tur": "Platform"},
 ]
 
 def get_session():
-    """Gerçek bir tarayıcı gibi davranan oturum açar"""
+    """Bot korumasını aşan tarayıcı taklidi"""
     session = requests.Session(impersonate="chrome120")
     session.headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"{SITE_URL}/",
+        "Origin": SITE_URL,
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     return session
 
 def resolve_video(dizipal_url):
     """
-    GÜÇLENDİRİLMİŞ ÇÖZÜCÜ:
-    Sayfadaki tüm potansiyel oynatıcıları dener.
+    Hem Dizi hem Film için akıllı link çözücü.
+    yt-dlp yerine doğrudan curl_cffi ve Regex kullanır (Daha hızlı ve engellenmez).
     """
-    print(f"\n--- VİDEO ANALİZİ BAŞLADI: {dizipal_url} ---")
+    print(f"\n--- ANALİZ BAŞLADI: {dizipal_url} ---")
     session = get_session()
     
     try:
         # 1. Sayfaya Git
-        resp = session.get(dizipal_url, timeout=15)
-        if resp.status_code != 200:
-            print(f"[HATA] Sayfa açılamadı: {resp.status_code}")
-            return None
-            
+        resp = session.get(dizipal_url, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 2. Sayfadaki TÜM Iframe'leri bul (Sınırlama yapmıyoruz)
+        # --- DİZİ KONTROLÜ (DÜZELTME BURADA) ---
+        # Eğer sayfada video yoksa ama bölüm listesi varsa, bu bir dizi ana sayfasıdır.
+        # İlk bölüme yönlendirmemiz lazım.
+        episode_list = soup.select("div.episode-item a")
+        if episode_list:
+            first_ep_link = episode_list[0]['href']
+            if not first_ep_link.startswith("http"): first_ep_link = SITE_URL + first_ep_link
+            print(f"[YÖNLENDİRME] Bu bir dizi sayfası. İlk bölüme gidiliyor: {first_ep_link}")
+            
+            # Kendini tekrar çağır (Recursive) ama bu sefer bölüm linkiyle
+            # Sonsuz döngüye girmesin diye kontrol
+            if first_ep_link != dizipal_url:
+                return resolve_video(first_ep_link)
+
+        # --- OYNATICI (IFRAME) BULMA ---
         iframes = soup.find_all('iframe')
-        print(f"[BİLGİ] Sayfada {len(iframes)} adet iframe bulundu.")
+        target_iframe = None
         
-        valid_src = None
-        
-        # 3. Doğru Iframe'i bulmak için döngü
         for iframe in iframes:
             src = iframe.get('src') or iframe.get('data-src')
             if not src: continue
+            # Reklamları atla
+            if "google" in src or "youtube" in src or "facebook" in src: continue
             
-            # Reklamları ele
-            if "google" in src or "youtube" in src or "facebook" in src:
-                continue
-                
-            # Link düzeltme
-            if src.startswith("//"): src = "https:" + src
-            if src.startswith("/"): src = SITE_URL + src
+            # Vidmoly vb. genellikle bu domainlerde olur
+            # Loglardaki 'ag2m4.cfd' domainini yakalamak için
+            target_iframe = src
+            break # İlk geçerliyi al
             
-            print(f"[DENENİYOR] Potansiyel Kaynak: {src}")
-            
-            # Bu link muhtemelen video oynatıcıdır, yt-dlp ile deneyelim
-            try:
-                ydl_opts = {
-                    'quiet': True, 
-                    'no_warnings': True,
-                    'format': 'best',
-                    # Referer header'ı bazı siteler için şarttır
-                    'http_headers': {'Referer': SITE_URL} 
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # extract_info ağırdır ama en garantisidir
-                    info = ydl.extract_info(src, download=False)
-                    
-                    if 'url' in info:
-                        print(f"[BAŞARILI] Video Linki Çözüldü: {info['url'][:50]}...")
-                        return info['url']
-                    elif 'entries' in info:
-                        # Bazen playlist döner, ilkini al
-                        return info['entries'][0]['url']
-                        
-            except Exception as e:
-                print(f"[BAŞARISIZ] yt-dlp bu kaynağı çözemedi: {e}")
-                continue
+        if not target_iframe:
+            print("[HATA] Iframe bulunamadı.")
+            return None
 
-        print("[KRİTİK] Hiçbir iframe çözülemedi.")
+        # Link düzeltmeleri
+        if target_iframe.startswith("//"): target_iframe = "https:" + target_iframe
+        if target_iframe.startswith("/"): target_iframe = SITE_URL + target_iframe
+        
+        print(f"[KAYNAK BULUNDU] Iframe: {target_iframe}")
+
+        # --- OYNATICIYI ÇÖZME (MANUEL REGEX) ---
+        # yt-dlp timeout yiyor, bu yüzden curl_cffi ile biz giriyoruz.
+        # Referer olarak site adresini göstermek zorundayız yoksa açılmaz.
+        session.headers.update({"Referer": SITE_URL})
+        
+        player_html = session.get(target_iframe, timeout=10).text
+        
+        # 1. Yöntem: Standart 'file: "..."' yapısı
+        match = re.search(r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', player_html)
+        if match:
+            m3u8 = match.group(1)
+            print(f"[BAŞARILI] Link Çözüldü: {m3u8}")
+            return m3u8
+        
+        # 2. Yöntem: JavaScript içine gizlenmiş linkler (Vidmoly Packing)
+        # Genellikle 'sources: [{file:"..."}]' şeklindedir
+        match2 = re.search(r'sources:\s*\[\s*\{\s*file:\s*["\']([^"\']+)["\']', player_html)
+        if match2:
+            m3u8 = match2.group(1)
+            print(f"[BAŞARILI] (JS) Link Çözüldü: {m3u8}")
+            return m3u8
+
+        print("[BAŞARISIZ] Regex linki bulamadı. Site yapısı değişmiş olabilir.")
+        # Burada son çare olarak yt-dlp denenebilir ama senin loglarda yt-dlp patladığı için buraya koymadım.
         return None
 
     except Exception as e:
@@ -106,17 +121,14 @@ def fetch_category(kategori):
     try:
         resp = session.get(kategori["url"], timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
+        items = soup.select("article.type2 ul li, div.movie-item")
         
-        items = soup.select("article.type2 ul li, div.movie-item, div.episode-item")
         parsed = []
-        
         for item in items:
             a = item.select_one("a")
             if not a: continue
-            
             link = a['href']
             if not link.startswith("http"): link = SITE_URL + link
-            
             title = item.select_one(".title, .name").text.strip() if item.select_one(".title, .name") else "Bilinmeyen"
             img = item.select_one("img")
             img_url = img['src'] if img else ""
@@ -148,8 +160,6 @@ def all_in_one():
 def watch():
     target_url = request.args.get('url')
     if not target_url: return "URL Yok", 400
-    
-    # URL Decode işlemi (Önemli! Bazen %2F gibi karakterler sorun çıkarır)
     target_url = urllib.parse.unquote(target_url)
     
     real_url = resolve_video(target_url)
@@ -157,8 +167,7 @@ def watch():
     if real_url:
         return redirect(real_url)
     else:
-        return "Video Bulunamadı (Terminaldeki Loglara Bakın)", 404
+        return "Video Bulunamadı (Server Loguna Bakın)", 404
 
 if __name__ == '__main__':
-    # Debug modu açık, hataları ekrana basar
     app.run(host='0.0.0.0', port=PORT, debug=True)
