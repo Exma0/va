@@ -16,7 +16,7 @@ from urllib.parse import quote, unquote
 PORT = 8080
 CHUNK_SIZE = 16384
 SITE_URL = "https://dizipal1219.com" # Güncel adresi buraya yaz
-MAX_WORKERS = 5 # Tarama hızı
+MAX_WORKERS = 100 # Tarama hızı
 
 # --- VERİ HAVUZU ---
 # İçerikleri burada tutacağız
