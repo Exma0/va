@@ -10,7 +10,7 @@ from flask import Flask, Response, request, stream_with_context
 
 # ================= CONFIG =================
 PORT = 8080
-CHUNK_SIZE = 16384 
+CHUNK_SIZE = 16384
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -182,15 +182,9 @@ def root():
         enc_url = quote(real_url)
         enc_ref = quote(ref)
         
-        # Proxy
+        # Sadece Proxy Linki
         out.append(f'#EXTINF:-1 group-title="{group}",{name}')
         out.append(f'{host}/api/m3u8?u={enc_url}&r={enc_ref}')
-        # Direkt (VLC vb. için Headerlı)
-        out.append(f'#EXTINF:-1 group-title="{group}",{name} (Direkt)')
-        out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
-        out.append(f'#EXTVLCOPT:http-referrer={ref}')
-        out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{ref}"}}')
-        out.append(real_url)
 
     for c in ANDRO_LIST:
         add_channel("Andro", c["name"], URL_ANDRO.format(c["id"]), REF_ANDRO)
@@ -203,8 +197,6 @@ def root():
         name = re.sub(r'\s*\(.*?\)', '', c["name"])
         add_channel("Fixed", name, URL_FIXED.format(c["id"]), REF_FIXED)
 
-    # Vavoo kısmı buradan tamamen kaldırılmıştır.
-
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
 # ================= M3U8 PROXY =================
@@ -213,8 +205,6 @@ def api_m3u8():
     u = request.args.get('u')
     rfr = request.args.get('r')
     
-    # URL encoded geldiyse bazen decode gerekebilir ama requests genelde çözer.
-    # Biz yine de parametre olarak gelen URL'in düzgün olduğundan emin olalım.
     if not u:
         return Response("No URL", 400)
 
@@ -242,7 +232,7 @@ def api_m3u8():
             try:
                 r = session.get(u, headers=h, timeout=10, verify=False)
             except:
-                pass # İlk istek başarısız olursa orijinal içerikle devam et
+                pass 
 
     base = r.url.rsplit('/',1)[0]
     host = request.host_url.rstrip('/')
