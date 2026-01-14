@@ -6,20 +6,20 @@ import re
 import concurrent.futures
 import time
 import threading
+import binascii
 
 app = Flask(__name__)
 
 # --- AYARLAR ---
-SITE_URL = "https://dizipal1219.com" # Güncel adres
+SITE_URL = "https://dizipal1219.com" # Güncel adresi kontrol et
 PORT = 5000
-MAX_SAYFA = 3      # Her kategoriden kaç sayfa taransın?
-CACHE_SURESI = 3600 # Liste kaç saniyede bir güncellensin? (1 Saat)
+MAX_SAYFA = 3      
+CACHE_SURESI = 3600
 
-# --- RAM BELLEK DEĞİŞKENLERİ ---
-# Veriler dosya yerine bu değişkenlerde tutulacak
-M3U_CACHE = None       # Hazır listenin tutulduğu değişken
-LAST_UPDATE_TIME = 0   # Son güncellenme zamanı
-IS_UPDATING = False    # Şu an güncelleme yapılıyor mu?
+# --- RAM BELLEK ---
+M3U_CACHE = None
+LAST_UPDATE_TIME = 0
+IS_UPDATING = False
 
 KAYNAKLAR = [
     {"ad": "Yeni Filmler", "url": f"{SITE_URL}/filmler", "tur": "Film"},
@@ -40,7 +40,6 @@ def get_session():
     }
     return session
 
-# --- 1. VİDEO ÇÖZÜCÜ ---
 def resolve_video(dizipal_url):
     print(f"\n[CANLI İSTEK] {dizipal_url}")
     session = get_session()
@@ -48,13 +47,13 @@ def resolve_video(dizipal_url):
         resp = session.get(dizipal_url, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
 
-        # Dizi Kontrolü: Video yoksa ilk bölüme git
+        # Dizi Kontrolü
         episode_links = soup.select("div.episode-item a")
         if episode_links:
             first_ep = episode_links[0]['href']
             if not first_ep.startswith("http"): first_ep = SITE_URL + first_ep
             if first_ep != dizipal_url:
-                print(f"  -> Dizi sayfası, ilk bölüme yönlendiriliyor...")
+                print(f"  -> Dizi yönlendirmesi...")
                 return resolve_video(first_ep)
 
         # Iframe Bulma
@@ -71,7 +70,7 @@ def resolve_video(dizipal_url):
         if src.startswith("//"): src = "https:" + src
         if src.startswith("/"): src = SITE_URL + src
 
-        # Regex ile Link Çıkarma
+        # Regex
         session.headers.update({"Referer": SITE_URL})
         html = session.get(src, timeout=8).text
         
@@ -83,15 +82,13 @@ def resolve_video(dizipal_url):
         
         return None
     except Exception as e:
-        print(f"Çözme Hatası: {e}")
+        print(f"Hata: {e}")
         return None
 
-# --- 2. TARAMA İŞLEMİ ---
 def fetch_category_content(kategori):
     session = get_session()
     parsed_items = []
     
-    # Hız için her kategoriden sadece belirli sayıda sayfa çek
     for sayfa in range(1, MAX_SAYFA + 1):
         target = f"{kategori['url']}/page/{sayfa}" if sayfa > 1 else kategori['url']
         try:
@@ -118,80 +115,77 @@ def fetch_category_content(kategori):
     return parsed_items
 
 def update_ram_cache(base_host):
-    """Listeyi tarar ve RAM değişkenine kaydeder"""
     global M3U_CACHE, LAST_UPDATE_TIME, IS_UPDATING
     
     if IS_UPDATING: return
     IS_UPDATING = True
     
-    print("\n>>> RAM ÖNBELLEK GÜNCELLENİYOR... (Arka Planda)")
-    start_time = time.time()
+    print("\n>>> RAM GÜNCELLENİYOR... (VOD MODU)")
     
     temp_list = []
-    # Paralel tarama (Multi-thread)
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_category_content, k) for k in KAYNAKLAR]
         for f in concurrent.futures.as_completed(futures):
             temp_list.extend(f.result())
             
-    # M3U String Oluşturma
-    # Bellekte string birleştirme (String Builder mantığı)
     m3u_lines = ["#EXTM3U"]
     
     for item in temp_list:
-        enc_link = urllib.parse.quote(item['link'])
-        proxy_link = f"{base_host}watch?url={enc_link}"
+        # URL'yi HEX formatına çevirip sonuna .mp4 ekliyoruz
+        # Bu sayede IPTV oynatıcı bunun bir VİDEO DOSYASI olduğunu sanıyor
+        url_bytes = item['link'].encode('utf-8')
+        hex_url = binascii.hexlify(url_bytes).decode('utf-8')
+        
+        # Link Yapısı: http://ip:5000/stream/HEXKODU.mp4
+        proxy_link = f"{base_host}stream/{hex_url}.mp4"
+        
+        # Smarters Pro'nun VOD olarak tanıması için type="vod" ekliyoruz (bazı versiyonlar için)
+        # Ancak en önemlisi linkin .mp4 ile bitmesidir.
         line = f'#EXTINF:-1 tvg-logo="{item["img"]}" group-title="{item["group"]}",{item["title"]}\n{proxy_link}'
         m3u_lines.append(line)
         
-    # Global değişkeni güncelle
     M3U_CACHE = "\n".join(m3u_lines)
     LAST_UPDATE_TIME = time.time()
     IS_UPDATING = False
-    
-    print(f">>> GÜNCELLEME BİTTİ! {len(temp_list)} içerik belleğe alındı ({round(time.time()-start_time, 2)} sn).")
+    print(">>> GÜNCELLEME BİTTİ (VOD UYUMLU)!")
 
-# --- 3. FLASK ROTALARI ---
+# --- ROTALAR ---
 
 @app.route('/')
 def playlist():
     global M3U_CACHE
     base_host = request.host_url
     
-    current_time = time.time()
-    
-    # 1. Durum: Hiç veri yok (İlk açılış) -> Mecbur bekletip yükleyeceğiz.
     if M3U_CACHE is None:
-        print("İlk açılış: Liste hazırlanıyor, lütfen bekleyin...")
         update_ram_cache(base_host)
-        
-    # 2. Durum: Veri var ama eski -> Eskiyi göster, arkada yenisini hazırla.
-    elif (current_time - LAST_UPDATE_TIME) > CACHE_SURESI:
-        print("Liste eski: Arka planda güncelleme başlatıldı.")
+    elif (time.time() - LAST_UPDATE_TIME) > CACHE_SURESI:
         threading.Thread(target=update_ram_cache, args=(base_host,)).start()
         
-    # Bellekteki veriyi sun
     return Response(M3U_CACHE, mimetype='audio/x-mpegurl')
 
-@app.route('/watch')
-def watch():
-    target_url = request.args.get('url')
-    if not target_url: return "URL Yok", 400
-    target_url = urllib.parse.unquote(target_url)
-    
-    real_url = resolve_video(target_url)
-    
-    if real_url:
-        return redirect(real_url)
-    else:
-        return "Video Bulunamadı", 404
+# --- YENİ ROTA: .mp4 Uzantılı Sahte Video Linki ---
+@app.route('/stream/<hex_url>.mp4')
+def stream_video(hex_url):
+    try:
+        # Hex kodunu tekrar normal URL'ye çevir
+        original_url = binascii.unhexlify(hex_url).decode('utf-8')
+        
+        # Videoyu çöz
+        real_url = resolve_video(original_url)
+        
+        if real_url:
+            return redirect(real_url)
+        else:
+            return "Video Bulunamadı", 404
+    except Exception as e:
+        print(f"Hata: {e}")
+        return "Hatali Link", 400
 
 @app.route('/refresh')
 def force_refresh():
     base_host = request.host_url
     threading.Thread(target=update_ram_cache, args=(base_host,)).start()
-    return "Manuel güncelleme tetiklendi."
+    return "Guncelleniyor..."
 
 if __name__ == '__main__':
-    print("Sunucu Başlatıldı. İlk istekte liste belleğe alınacak.")
     app.run(host='0.0.0.0', port=PORT)
