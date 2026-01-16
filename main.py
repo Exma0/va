@@ -1,247 +1,87 @@
 from gevent import monkey; monkey.patch_all()
-from flask import Flask, Response, request, stream_with_context, redirect
+import requests, re, logging
+from urllib.parse import quote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from gevent.pywsgi import WSGIServer
 from gevent import sleep
-from curl_cffi import requests as crequests # Cloudflare'i geçmek için
-import requests # Standart requests (Stream için)
-from bs4 import BeautifulSoup
-import yt_dlp
-import re
-import threading
-import time
-import base64
-from urllib.parse import quote, unquote
+from flask import Flask, Response, request, stream_with_context
 
-# --- AYARLAR ---
-PORT = 8080
-CHUNK_SIZE = 16384
-SITE_URL = "https://dizipal1219.com" # Güncel adresi buraya yaz
-MAX_WORKERS = 100 # Tarama hızı
+# AYARLAR
+PORT, CHUNK_SIZE = 8080, 16384
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+CONF = {
+    'ANDRO': {'r': 'https://taraftarium.is/', 'u': 'https://andro.adece12.sbs/checklist/{}.m3u8'},
+    'HTML':  {'r': 'https://inattv1212.xyz/', 'u': 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'}
+}
 
-# --- VERİ HAVUZU ---
-# İçerikleri burada tutacağız
-CONTENT_CACHE = []
-CACHE_LOCK = threading.Lock()
+# KANAL LİSTELERİ
+ANDRO_L = [('BeIN Sports 1','receptestt'),('BeIN Sports 2','androstreamlivebs2'),('BeIN Sports 3','androstreamlivebs3'),('BeIN Sports 4','androstreamlivebs4'),('BeIN Sports 5','androstreamlivebs5'),('BeIN Sports Max 1','androstreamlivebsm1'),('BeIN Sports Max 2','androstreamlivebsm2'),('S Sport','androstreamlivess1'),('S Sport 2','androstreamlivess2'),('S Sport Plus','androstreamlivessplus1'),('Tivibu Spor','androstreamlivets'),('Tivibu Spor 1','androstreamlivets1'),('Tivibu Spor 2','androstreamlivets2'),('Tivibu Spor 3','androstreamlivets3'),('Tivibu Spor 4','androstreamlivets4'),('Smart Spor 1','androstreamlivesm1'),('Smart Spor 2','androstreamlivesm2'),('Eurosport 1','androstreamlivees1'),('Eurosport 2','androstreamlivees2'),('İDMAN TV','androstreamliveidm'),('TRT 1','androstreamlivetrt1'),('TRT Spor','androstreamlivetrts'),('TRT Spor Yıldız','androstreamlivetrtsy'),('ATV','androstreamliveatv'),('A Spor','androstreamliveas'),('A2','androstreamlivea2'),('TJK TV','androstreamlivetjk'),('HT Spor','androstreamliveht'),('NBA TV','androstreamlivenba'),('TV8','androstreamlivetv8'),('TV8.5','androstreamlivetv85'),('Tabii Spor','androstreamlivetb'),('Tabii Spor 1','androstreamlivetb1'),('Tabii Spor 2','androstreamlivetb2'),('Tabii Spor 3','androstreamlivetb3'),('Tabii Spor 4','androstreamlivetb4'),('Tabii Spor 5','androstreamlivetb5'),('Tabii Spor 6','androstreamlivetb6'),('Tabii Spor 7','androstreamlivetb7'),('Tabii Spor 8','androstreamlivetb8'),('FB TV','androstreamlivefb'),('CBC Sport','androstreamlivecbcs'),('GS TV','androstreamlivegs'),('Sports TV','androstreamlivesptstv'),('Exxen TV','androstreamliveexn'),('Exxen Sports 1','androstreamliveexn1'),('Exxen Sports 2','androstreamliveexn2'),('Exxen Sports 3','androstreamliveexn3'),('Exxen Sports 4','androstreamliveexn4'),('Exxen Sports 5','androstreamliveexn5'),('Exxen Sports 6','androstreamliveexn6'),('Exxen Sports 7','androstreamliveexn7'),('Exxen Sports 8','androstreamliveexn8')]
+HTML_L = [('BeIN Sports 1 (Alt)','yayininat'),('BeIN Sports 2 (Alt)','yayinb2'),('BeIN Sports 3 (Alt)','yayinb3'),('BeIN Sports 4 (Alt)','yayinb4'),('BeIN Sports 5 (Alt)','yayinb5'),('BeIN Max 1 (Alt)','yayinbm1'),('BeIN Max 2 (Alt)','yayinbm2'),('S Sport (Alt)','yayinss'),('S Sport 2 (Alt)','yayinss2'),('Tivibu 1 (Alt)','yayint1'),('Tivibu 2 (Alt)','yayint2'),('Tivibu 3 (Alt)','yayint3'),('Tivibu 4 (Alt)','yayint4'),('Smartspor (Alt)','yayinsmarts'),('Smartspor 2 (Alt)','yayinsms2'),('TRT Spor (Alt)','yayintrtspor'),('TRT Spor 2 (Alt)','yayintrtspor2'),('TRT 1 (Alt)','yayintrt1'),('A Spor (Alt)','yayinas'),('ATV (Alt)','yayinatv'),('TV 8 (Alt)','yayintv8'),('TV 8,5 (Alt)','yayintv85'),('NBA TV (Alt)','yayinnbatv'),('Euro Sport 1 (Alt)','yayineu1'),('Euro Sport 2 (Alt)','yayineu2')]
 
+requests.packages.urllib3.disable_warnings()
 app = Flask(__name__)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# --- YARDIMCI FONKSİYONLAR ---
-
-def base64_encode(s):
-    return base64.urlsafe_b64encode(s.encode()).decode()
-
-def base64_decode(s):
-    return base64.urlsafe_b64decode(s.encode()).decode()
-
-class DiziPalResolver:
-    """Siteye gidip M3U8 linkini o an çözen sınıf"""
-    def __init__(self):
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"{SITE_URL}/"
-        }
-
-    def get_real_m3u8(self, page_url):
-        """Sayfa linkinden gerçek video linkini bulur"""
-        print(f" [RESOLVER] Link çözülüyor: {page_url}")
-        try:
-            # curl_cffi kullanarak siteye istek at (Cloudflare bypass)
-            session = crequests.Session(impersonate="chrome120")
-            session.headers.update(self.headers)
-            resp = session.get(page_url, timeout=10)
-            
-            if resp.status_code != 200:
-                print("Siteye erişilemedi.")
-                return None
-            
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # iframe ara
-            iframe = soup.select_one(".series-player-container iframe") or \
-                     soup.select_one("div#vast_new iframe") or \
-                     soup.select_one("iframe")
-                     
-            if not iframe:
-                print("Iframe bulunamadı.")
-                return None
-            
-            iframe_src = iframe.get('src')
-            if iframe_src.startswith("//"): iframe_src = "https:" + iframe_src
-            
-            # 1. Regex ile dene
-            html = session.get(iframe_src, headers={"Referer": SITE_URL}, timeout=5).text
-            match = re.search(r'file:\s*"([^"]+)"', html)
-            if match: 
-                return match.group(1)
-            
-            # 2. yt-dlp ile dene
-            ydl_opts = {'quiet': True, 'no_warnings': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(iframe_src, download=False)
-                return info.get('url')
-                
-        except Exception as e:
-            print(f"Çözme hatası: {e}")
-            return None
-
-class DiziPalScanner:
-    """Arka planda siteyi tarayıp listeyi güncelleyen sınıf"""
-    def __init__(self):
-        self.resolver = DiziPalResolver()
-        self.kategoriler = {
-            "Filmler": f"{SITE_URL}/filmler",
-            "Diziler": f"{SITE_URL}/diziler",
-            "Netflix": f"{SITE_URL}/koleksiyon/netflix"
-        }
-
-    def scan(self):
-        print("--- TARAMA BAŞLADI ---")
-        temp_list = []
-        
-        # Sadece ilk 2 sayfayı tarar (Test amaçlı, artırabilirsin)
-        for cat, url in self.kategoriler.items():
-            for page in range(1, 3): 
-                target = url if page == 1 else f"{url}/page/{page}"
-                try:
-                    session = crequests.Session(impersonate="chrome120")
-                    resp = session.get(target, timeout=10)
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    
-                    items = soup.select("article.type2 ul li") or soup.select("div.movie-item")
-                    for item in items:
-                        a = item.select_one("a")
-                        if not a: continue
-                        
-                        link = a['href']
-                        if not link.startswith("http"): link = SITE_URL + link
-                        
-                        title = item.select_one(".title").text.strip() if item.select_one(".title") else "Bilinmeyen"
-                        img = item.select_one("img")
-                        poster = img.get('src') if img else ""
-                        if poster and not poster.startswith("http"): poster = SITE_URL + poster
-
-                        temp_list.append({
-                            "group": cat,
-                            "title": title,
-                            "url": link, # Bu sayfa linki, video linki değil!
-                            "poster": poster
-                        })
-                except Exception as e:
-                    print(f"Tarama hatası ({cat}): {e}")
-        
-        # Listeyi güncelle
-        global CONTENT_CACHE
-        with CACHE_LOCK:
-            CONTENT_CACHE = temp_list
-        print(f"--- TARAMA BİTTİ: {len(CONTENT_CACHE)} içerik bulundu ---")
-
-# --- FLASK ROTLARI ---
+s = requests.Session()
+s.headers.update({"User-Agent": UA, "Connection": "keep-alive"})
+s.mount("http://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.1, status_forcelist=[500,502,503,504]), pool_connections=200, pool_maxsize=200))
+s.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.1, status_forcelist=[500,502,503,504]), pool_connections=200, pool_maxsize=200))
 
 @app.route('/')
-def playlist():
-    """Ana M3U Listesini oluşturur"""
-    host = request.host_url.rstrip('/')
-    out = ["#EXTM3U"]
+def root():
+    h, out = request.host_url.rstrip('/'), ["#EXTM3U"]
     
-    with CACHE_LOCK:
-        for item in CONTENT_CACHE:
-            # Linki güvenli hale getirip url parametresi olarak ekliyoruz
-            safe_url = base64_encode(item['url'])
-            
-            # M3U satırı
-            out.append(f'#EXTINF:-1 group-title="{item["group"]}" tvg-logo="{item["poster"]}", {item["title"]}')
-            # Bu link tıklandığında /resolve endpointine gidecek
-            out.append(f'{host}/resolve?u={safe_url}')
-            
+    def add(grp, name, url, ref):
+        # Sadece Proxy linki ekleniyor, direkt linkler kaldırıldı
+        out.append(f'#EXTINF:-1 group-title="{grp}",{name}')
+        out.append(f'{h}/api/m3u8?u={quote(url)}&r={quote(ref)}')
+
+    for n, i in ANDRO_L: 
+        add("Andro", n, CONF['ANDRO']['u'].format(i), CONF['ANDRO']['r'])
+        
+    for n, i in HTML_L:  
+        add("HTML", re.sub(r'\s*\(.*?\)', '', n), CONF['HTML']['u'].format(i), CONF['HTML']['r'])
+        
     return Response("\n".join(out), content_type="application/x-mpegURL")
 
-@app.route('/resolve')
-def resolve_stream():
-    """Tıklanan içeriğin gerçek M3U8 linkini bulur ve proxy'ye yönlendirir"""
-    u_enc = request.args.get('u')
-    if not u_enc: return "No URL", 400
-    
-    page_url = base64_decode(u_enc)
-    
-    resolver = DiziPalResolver()
-    real_m3u8 = resolver.get_real_m3u8(page_url)
-    
-    if real_m3u8:
-        # Bulunan linki proxy_m3u8 endpointine yönlendir
-        host = request.host_url.rstrip('/')
-        return redirect(f"{host}/api/m3u8?u={quote(real_m3u8)}")
-    else:
-        return "Video Bulunamadı veya Çözülemedi", 404
-
 @app.route('/api/m3u8')
-def proxy_m3u8():
-    """Gerçek M3U8 dosyasını indirir ve içindeki linkleri yerel sunucuya çevirir"""
-    u = request.args.get('u')
-    if not u: return "No URL", 400
-    
+def m3u8():
+    u, rfr = request.args.get('u'), request.args.get('r')
+    if not u: return Response("No URL", 400)
+    h = {"User-Agent": UA, "Referer": rfr} if rfr else {"User-Agent": UA}
     try:
-        # İstekleri requests ile atıyoruz (Gevent patchli)
-        r = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, verify=False, timeout=10)
-        
-        base_url = u.rsplit('/', 1)[0]
-        host = request.host_url.rstrip('/')
-        new_lines = []
-        
-        for line in r.text.splitlines():
-            if line.strip().startswith('#'):
-                new_lines.append(line)
-            elif line.strip():
-                # TS veya alt M3U8 linki
-                full_url = line if line.startswith('http') else f"{base_url}/{line}"
-                
-                # Eğer başka bir m3u8 ise yine bu fonksiyona, ts ise ts fonksiyonuna
-                if ".m3u8" in full_url:
-                    new_url = f"{host}/api/m3u8?u={quote(full_url)}"
-                else:
-                    new_url = f"{host}/api/ts?u={quote(full_url)}"
-                new_lines.append(new_url)
-                
-        return Response("\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
-    except Exception as e:
-        return f"M3U8 Proxy Hatası: {e}", 502
+        r = s.get(u, headers=h, timeout=10, verify=False)
+        if "EXT-X-STREAM-INF" in r.text:
+            ls = r.text.splitlines()
+            best = max([(int(re.search(r'BANDWIDTH=(\d+)', l).group(1)), ls[i+1].strip()) for i, l in enumerate(ls) if "BANDWIDTH=" in l], key=lambda x:x[0], default=(0,None))[1]
+            if best:
+                u = best if best.startswith('http') else f"{r.url.rsplit('/',1)[0]}/{best}"
+                r = s.get(u, headers=h, timeout=10, verify=False)
+    except Exception as e: return Response(f"Err: {e}", 502)
+    
+    base, host, out = r.url.rsplit('/',1)[0], request.host_url.rstrip('/'), []
+    for l in r.text.splitlines():
+        if not l or l.startswith('#'): out.append(l)
+        else:
+            full = l if l.startswith('http') else f"{base}/{l}"
+            # TS istekleri de proxy'ye yönlendiriliyor
+            out.append(f"{host}/api/ts?u={quote(full)}{'&r='+quote(rfr) if rfr else ''}")
+    return Response("\n".join(out), content_type="application/vnd.apple.mpegurl")
 
 @app.route('/api/ts')
-def proxy_ts():
-    """Video parçalarını (TS) indirip istemciye yayınlar"""
-    u = request.args.get('u')
-    if not u: return "No URL", 400
-    
-    try:
-        # Stream isteği
-        req = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, stream=True, verify=False, timeout=10)
-        
-        def generate():
-            for chunk in req.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    yield chunk
-                    sleep(0) # Gevent için context switch
-                    
-        return Response(stream_with_context(generate()), content_type="video/mp2t")
-    except Exception as e:
-        return f"TS Error: {e}", 500
-
-# --- BAŞLATMA ---
-
-def start_scanner_loop():
-    scanner = DiziPalScanner()
-    while True:
-        scanner.scan()
-        # Her 30 dakikada bir listeyi yenile
-        time.sleep(1800)
+def ts():
+    u, rfr = request.args.get('u'), request.args.get('r')
+    if not u: return Response("No URL", 400)
+    h = {"User-Agent": UA, "Referer": rfr} if rfr else {"User-Agent": UA}
+    try: r = s.get(u, headers=h, stream=True, verify=False, timeout=(5, 10))
+    except: return Response("Err", 502)
+    def g():
+        try:
+            for c in r.iter_content(CHUNK_SIZE):
+                if c: yield c; sleep(0)
+        except: pass
+    return Response(stream_with_context(g()), headers=[("Content-Type","video/mp2t")], status=r.status_code)
 
 if __name__ == "__main__":
-    # 1. Arka planda tarayıcıyı başlat
-    t = threading.Thread(target=start_scanner_loop)
-    t.daemon = True
-    t.start()
-    
-    # 2. Web sunucusunu başlat
-    print(f"Sunucu çalışıyor: http://localhost:{PORT}")
-    print("M3U Linkiniz: http://localhost:8080/")
-    
-    WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
+    print(f"Running on port: {PORT}"); WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
