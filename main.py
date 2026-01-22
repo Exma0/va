@@ -15,8 +15,8 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# EPG Kaynağı
-EPG_URL = "https://epgshare01.online/epgshare01/epg_ripper_TR1.xml.gz"
+# EPG Ana Dizini (Tarama yapılacak yer)
+EPG_BASE_URL = "https://epgshare01.online/epgshare01/"
 
 # Logo Ayarları (GitHub API)
 LOGO_API_URL = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries/turkey"
@@ -31,15 +31,16 @@ SOURCE_VAVOO_API = "https://vavoo.to/live2/index"
 URL_ANDRO = 'https://andro.adece12.sbs/checklist/{}.m3u8'
 URL_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'
 
-# Vavoo Sabit URL Şablonu (Senin İstediğin Format)
+# Vavoo Sabit URL Şablonu
 URL_VAVOO_TEMPLATE = "https://vavoo.to/play/{}/index.m3u8"
 
 urllib3.disable_warnings()
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# Global Logo Havuzu
+# Global Değişkenler
 AVAILABLE_LOGOS = []
+DYNAMIC_EPG_URLS = ""  # Otomatik bulunan EPG'ler buraya gelecek
 
 # ================= SESSION =================
 session = requests.Session()
@@ -62,12 +63,48 @@ adapter = HTTPAdapter(
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
+# ================= DİNAMİK EPG TARAYICI =================
+
+def fetch_dynamic_epg_urls():
+    """
+    Belirtilen EPG sitesine gider, HTML içeriğini tarar.
+    İçinde 'TR' geçen ve '.xml.gz' ile biten tüm dosyaları bulur.
+    Bunları virgülle birleştirip tek bir EPG kaynağı stringi yapar.
+    """
+    global DYNAMIC_EPG_URLS
+    print("EPG Kaynakları taranıyor...")
+    
+    try:
+        r = session.get(EPG_BASE_URL, timeout=10, verify=False)
+        if r.status_code == 200:
+            # HTML içindeki href linklerini bul (Regex)
+            # Şablon: epg_ripper_TR (herhangi bir şey) .xml.gz
+            files = re.findall(r'href=["\'](epg_ripper_TR.*?\.xml\.gz)["\']', r.text)
+            
+            # Bulunan dosya isimlerini tam URL'ye çevir ve tekilleştir (set)
+            full_urls = list(set([f"{EPG_BASE_URL}{f}" for f in files]))
+            
+            if full_urls:
+                # M3U formatında birden fazla EPG virgülle ayrılır
+                DYNAMIC_EPG_URLS = ",".join(full_urls)
+                print(f"Otomatik EPG'ler Bulundu ({len(full_urls)} adet):")
+                for u in full_urls:
+                    print(f" - {u}")
+            else:
+                print("TR uzantılı EPG dosyası bulunamadı, varsayılan kullanılacak.")
+                DYNAMIC_EPG_URLS = f"{EPG_BASE_URL}epg_ripper_TR1.xml.gz"
+        else:
+            print("EPG sitesine ulaşılamadı.")
+            DYNAMIC_EPG_URLS = f"{EPG_BASE_URL}epg_ripper_TR1.xml.gz" # Fallback
+            
+    except Exception as e:
+        print(f"EPG Tarama Hatası: {e}")
+        DYNAMIC_EPG_URLS = f"{EPG_BASE_URL}epg_ripper_TR1.xml.gz"
+
 # ================= LOGO VE İSİM İŞLEME MOTORU =================
 
 def fetch_available_logos():
-    """
-    Sunucu başladığında GitHub API'den mevcut logo dosya isimlerini çeker.
-    """
+    """GitHub API'den mevcut logo listesini çeker."""
     global AVAILABLE_LOGOS
     print("Logolar GitHub'dan çekiliyor...")
     try:
@@ -77,12 +114,12 @@ def fetch_available_logos():
             AVAILABLE_LOGOS = [item['name'] for item in data if item['name'].endswith('.png')]
             print(f"Başarılı! {len(AVAILABLE_LOGOS)} adet logo hafızaya alındı.")
         else:
-            print(f"Logo listesi çekilemedi. Hata Kodu: {r.status_code}")
+            print(f"Logo listesi çekilemedi. Kod: {r.status_code}")
     except Exception as e:
         print(f"Logo API Hatası: {e}")
 
 def simplify_text(text):
-    """Metni karşılaştırma için en sade haline getirir."""
+    """Metni karşılaştırma için sadeleştirir."""
     text = str(text).lower()
     if text.endswith(".png"): text = text[:-4]
     if text.endswith("-tr"): text = text[:-3]
@@ -94,13 +131,13 @@ def simplify_text(text):
     return re.sub(r'[^a-z0-9]', '', text)
 
 def clean_channel_name(name):
-    """(1), (7), (Canlı) vb. temizler."""
+    """(1), (7), (Canlı) gibi ifadeleri temizler."""
     if not name: return ""
     clean = re.sub(r'\s*\([^)]*\)$', '', name)
     return clean.strip()
 
 def find_best_logo_url(channel_name):
-    """Kanal ismine en çok benzeyen logoyu bulur."""
+    """En iyi eşleşen logoyu bulur."""
     if not AVAILABLE_LOGOS: return ""
         
     target = simplify_text(channel_name)
@@ -191,7 +228,8 @@ HTML_LIST = [
 # ================= ROOT (M3U) =================
 @app.route('/')
 def root():
-    out = [f'#EXTM3U x-tvg-url="{EPG_URL}"']
+    # EPG URL'lerini Header'a ekle (Otomatik bulunanlar)
+    out = [f'#EXTM3U x-tvg-url="{DYNAMIC_EPG_URLS}"']
 
     def add_channel(group, raw_name, real_url, ref):
         # 1. İsmi Temizle
@@ -201,9 +239,11 @@ def root():
         
         # 3. Satırları Ekle
         out.append(f'#EXTINF:-1 group-title="{group}" tvg-name="{name}" tvg-logo="{logo_url}",{name}')
+        # Headerlar
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={ref}')
         out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{ref}"}}')
+        # URL
         out.append(real_url)
 
     # ANDRO
@@ -214,7 +254,7 @@ def root():
     for c in HTML_LIST:
         add_channel("HTML", c["name"], URL_HTML.format(c["id"]), REF_HTML)
 
-    # VAVOO (SABİT FORMAT YAPISI)
+    # VAVOO (Sabit URL Formatı)
     try:
         r = session.get(SOURCE_VAVOO_API, timeout=6, verify=False)
         if r.status_code == 200:
@@ -226,15 +266,11 @@ def root():
                     raw_name = i.get("name")
                     
                     if group == "Turkey" and source_url and raw_name:
-                        # 1. URL'den ID'yi çek (Regex ile rakamları al)
-                        # Örn: .../play3/123456.m3u8 -> 123456
+                        # URL içinden ID'yi çek
                         match = re.search(r'([0-9]+)\.m3u8', source_url)
-                        
                         if match:
                             vavoo_id = match.group(1)
-                            # 2. İstenilen SABİT formata çevir
                             fixed_url = URL_VAVOO_TEMPLATE.format(vavoo_id)
-                            
                             add_channel("Vavoo", raw_name, fixed_url, REF_VAVOO)
                         
     except Exception as e:
@@ -245,7 +281,11 @@ def root():
 
 # ================= START =================
 if __name__ == "__main__":
+    # 1. EPG'leri otomatik tara
+    fetch_dynamic_epg_urls()
+    # 2. Logoları yükle
     fetch_available_logos()
+    
     print(f"Server is running on port {PORT}")
-    print("Vavoo Format: Sabit (/play/{id}/index.m3u8)")
+    print(f"Aktif EPG Sayısı: {len(DYNAMIC_EPG_URLS.split(',')) if DYNAMIC_EPG_URLS else 0}")
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
