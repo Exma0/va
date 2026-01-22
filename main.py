@@ -1,6 +1,6 @@
 from gevent import monkey; monkey.patch_all()
 
-import requests, urllib3, logging, re
+import requests, urllib3, logging, re, unicodedata
 from flask import Flask, Response
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -15,22 +15,28 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Sadece Andro, HTML ve Vavoo Referansları kaldı
+# --- YENİ EPG VE LOGO AYARLARI ---
+# EPG Kaynağı (Genel dosya veya senin verdiğin dizin)
+EPG_URL = "https://epgshare01.online/epgshare01/epg_ripper_TR1.xml.gz" 
+# Logo Kaynağı (GitHub Raw adresi)
+LOGO_BASE_URL = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/turkey/"
+
+# --- REFERANSLAR ---
 REF_ANDRO = 'https://taraftarium.is/'
 REF_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/'
 REF_VAVOO = 'https://vavoo.to/'
 
-SOURCE_VAVOO = "https://vavoo.to"
+SOURCE_VAVOO_API = "https://vavoo.to/live2/index"
+
 URL_ANDRO = 'https://andro.adece12.sbs/checklist/{}.m3u8'
 URL_HTML  = 'https://ogr.d72577a9dd0ec6.sbs/{}.m3u8'
-URL_VAVOO = "https://vavoo.to/play/{}/index.m3u8"
+# Vavoo için sabit URL şablonu KALDIRILDI, artık dinamik alınıyor.
 
 urllib3.disable_warnings()
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # ================= SESSION =================
-# Vavoo listesini çekmek için gerekli session ayarları
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Connection": "keep-alive"})
 
@@ -50,6 +56,34 @@ adapter = HTTPAdapter(
 
 session.mount("http://", adapter)
 session.mount("https://", adapter)
+
+# ================= HELPER FUNCTIONS (YARDIMCI) =================
+
+def slugify(text):
+    """
+    Kanal ismini GitHub dosya ismine uygun hale getirir.
+    Örn: "BeIN Sports 1" -> "bein-sports-1"
+    """
+    text = text.lower()
+    # Türkçe karakter değişimi
+    replacements = {
+        'ı': 'i', 'ğ': 'g', 'ü': 'u', 'ş': 's', 'ö': 'o', 'ç': 'c',
+        'İ': 'i', 'Ğ': 'g', 'Ü': 'u', 'Ş': 's', 'Ö': 'o', 'Ç': 'c'
+    }
+    for src, dest in replacements.items():
+        text = text.replace(src, dest)
+    
+    # ASCII olmayanları temizle (unicode normalize)
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    # Harf ve sayı dışındakileri tire yap
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    # Baştaki ve sondaki tireleri sil
+    return text.strip('-')
+
+def get_logo_url(channel_name):
+    """GitHub üzerinden logo URL'si oluşturur."""
+    slug = slugify(channel_name)
+    return f"{LOGO_BASE_URL}{slug}.png"
 
 # ================= CHANNEL LISTS =================
 
@@ -140,20 +174,25 @@ HTML_LIST = [
 # ================= ROOT (M3U) =================
 @app.route('/')
 def root():
-    out = ["#EXTM3U"]
+    # M3U Header ve EPG Linki
+    out = [f'#EXTM3U x-tvg-url="{EPG_URL}"']
 
     def add_channel(group, name, real_url, ref):
-        # M3U Standart Başlık
-        out.append(f'#EXTINF:-1 group-title="{group}",{name}')
+        # Kanal logosu oluştur
+        clean_name = re.sub(r'\s*\(.*?\)', '', name).strip() # Parantez içini temizle (Logo bulmak için)
+        logo_url = get_logo_url(clean_name)
         
-        # Oynatıcılar için Header (User-Agent ve Referer)
-        # Bu kısım VLC, Tivimate, OTT Navigator vb. oynatıcıların
-        # yayını açabilmesi için gereklidir.
+        # M3U Satırı (EPG ID ve Logo ile)
+        # tvg-name: EPG eşleşmesi için kanalın temiz adı
+        # tvg-logo: GitHub'dan oluşturulan logo linki
+        out.append(f'#EXTINF:-1 group-title="{group}" tvg-name="{clean_name}" tvg-logo="{logo_url}",{name}')
+        
+        # Headerlar
         out.append(f'#EXTVLCOPT:http-user-agent={USER_AGENT}')
         out.append(f'#EXTVLCOPT:http-referrer={ref}')
         out.append(f'#EXTHTTP:{{"User-Agent":"{USER_AGENT}","Referer":"{ref}"}}')
         
-        # Orijinal Yayın Linki
+        # URL
         out.append(real_url)
 
     # 1. ANDRO Kaynakları
@@ -162,20 +201,36 @@ def root():
 
     # 2. HTML Kaynakları
     for c in HTML_LIST:
-        name = re.sub(r'\s*\(.*?\)', '', c["name"])
-        add_channel("HTML", name, URL_HTML.format(c["id"]), REF_HTML)
+        name_clean = re.sub(r'\s*\(.*?\)', '', c["name"])
+        add_channel("HTML", name_clean, URL_HTML.format(c["id"]), REF_HTML)
 
-    # 3. VAVOO Kaynakları (Otomatik Çekilir)
+    # 3. VAVOO Kaynakları (Otomatik & Dinamik Yapı)
     try:
-        r = session.get(f"{SOURCE_VAVOO}/live2/index", timeout=4, verify=False)
+        r = session.get(SOURCE_VAVOO_API, timeout=5, verify=False)
         if r.status_code == 200:
             data = r.json()
-            for i in data:
-                # Sadece Turkey grubu ve oynatılabilir linkleri al
-                if i.get("group") == "Turkey" and "/play/" in i.get("url",""):
-                    cid = i["url"].split("/play/")[1].split("/")[0]
-                    name = re.sub(r'\s*\(\d+\)', '', i["name"]).replace(",", " ")
-                    add_channel("Vavoo", name, URL_VAVOO.format(cid), REF_VAVOO)
+            
+            # Veri listesi mi kontrol et (Bazı durumlarda yapı değişebilir)
+            if isinstance(data, list):
+                for i in data:
+                    group = i.get("group")
+                    url = i.get("url")
+                    name = i.get("name")
+                    
+                    # Sadece Turkey grubu ve URL'si geçerli olanları al
+                    if group == "Turkey" and url and url.startswith("http"):
+                        # İsim temizliği (Sayıları ve gereksiz boşlukları sil)
+                        clean_name = re.sub(r'\s*\(\d+\)', '', name).replace(",", " ").strip()
+                        
+                        # --- DİNAMİK URL MANTIĞI ---
+                        # Eskiden URL'yi kendimiz oluşturuyorduk (format string ile).
+                        # Şimdi API ne veriyorsa onu kullanıyoruz.
+                        # Eğer URL parametre gerektiriyorsa (?n=1 vb) olduğu gibi alır.
+                        
+                        add_channel("Vavoo", clean_name, url, REF_VAVOO)
+            else:
+                print("Vavoo JSON formatı beklenmedik bir yapıda (Liste değil).")
+                
     except Exception as e:
         print(f"Vavoo Hatası: {e}")
         pass
@@ -185,6 +240,7 @@ def root():
 # ================= START =================
 if __name__ == "__main__":
     print(f"Server is running on port {PORT}")
+    print(f"EPG Source: {EPG_URL}")
+    print(f"Logo Source: {LOGO_BASE_URL}...")
     print("Mod: Direct (Proxy Disabled)")
-    print("Sources: ANDRO, HTML, VAVOO")
     WSGIServer(('0.0.0.0', PORT), app, log=None).serve_forever()
