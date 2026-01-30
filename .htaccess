@@ -1,0 +1,9 @@
+RewriteEngine On
+RewriteBase /
+
+# Mevcut dosya veya klasör varsa dokunma
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Tüm istekleri senin scriptine (index.php varsaydım) yönlendir
+RewriteRule ^(.*)$ index.php [QSA,L]
