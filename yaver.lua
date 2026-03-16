@@ -1,5 +1,5 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        YAVER - Koruyucu Kurt Sistemi  v23            ║
+-- ║        YAVER - Koruyucu Kurt Sistemi  v24            ║
 -- ║        Zırh • Parıldama • Görev • Vanilla AI         ║
 -- ╚══════════════════════════════════════════════════════╝
 
@@ -408,7 +408,7 @@ end
 -- ══════════════════════════════════════════════════════
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(23)
+    Plugin:SetVersion(24)
 
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -426,7 +426,7 @@ function Initialize(Plugin)
     -- AI kaldırıldığı için döngüyü sadece efektler için yavaşlatıyoruz (1 saniyede bir çalışır)
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, PeriodicWolfTask)
 
-    LOG("[YAVER] v23 - Manuel AI Kaldırıldı • Vanilla Evcil Hayvan Sistemi Aktif!")
+    LOG("[YAVER] v24 - Shift+Sağ Tık Kaldırıldı • Görev İlerleme Bildirimi Eklendi!")
     return true
 end
 
@@ -545,12 +545,6 @@ function OnRightClickingEntity(Player, Entity)
     local UUID = Player:GetUUID()
     if ActiveWolves[UUID] ~= Entity:GetUniqueID() then return false end
 
-    -- Oyuncu eğiliyorsa hiçbir işlem yapma (veya hub menüsünü açma vb.)
-    if Player:IsCrouched() then
-        cPluginManager:Get():ExecuteCommand(Player, "/hub")
-        return true
-    end
-
     local Item    = Player:GetEquippedItem()
     local MeatIDs = {
         [319]=true,[320]=true,[363]=true,[364]=true,[365]=true,
@@ -570,6 +564,14 @@ function OnRightClickingEntity(Player, Entity)
         Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! +50 XP, +10 Can")
 
         CheckQuests(UUID, "feed", 1)
+        
+        -- Besleme görevinin anlık ilerlemesini chate yazdır
+        local done = GetCompletedQuests(UUID)
+        if not done["q_feed10"] then
+            local stats = GetQuestStats(UUID)
+            local currentFeed = stats["feed"] or 0
+            Player:SendMessageInfo("§e[Görev] §7Şefkatli Sahip ilerlemesi: §a" .. currentFeed .. " / 10")
+        end
 
     else
         -- Vanilla'da sağ tıklamak kurdu oturtur, çanta açmak için bunu iptal etmeliyiz
