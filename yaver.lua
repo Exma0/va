@@ -358,7 +358,7 @@ local function GetBackpack(UUID)
     local rows = ld.bag  -- 1-6
 
     local Window = cLuaWindow(cWindow.wtChest, 9, rows,
-        "§8Yaver Çantası §7[Lv"..lvl.."] §e("..rows*9.." slot)")
+        "§8Yaver Cantasi §7[Lv"..lvl.."] §e("..(rows*9).." slot)")
 
     local Contents = Window:GetContents()
     local InvIni   = cIniFile()
@@ -595,7 +595,7 @@ function HandleStatsCommand(CmdSplit, Player)
     Player:SendMessageInfo("§c  Max Can: "..ld.hp)
     Player:SendMessageInfo("§4  Hasar Bonusu: +"..ld.dmg)
     Player:SendMessageInfo("§b  Hız: x"..ld.spd)
-    Player:SendMessageInfo("§d  Çanta: "..ld.bag.." satır ("..ld.bag*9.." slot)")
+    Player:SendMessageInfo("§d  Canta: "..ld.bag.." satir ("..(ld.bag*9).." slot)")
     Player:SendMessageInfo("§a  Tamamlanan Görev: "..doneCount.."/"..#QUEST_DEFS)
     Player:SendMessageInfo("§e  Binme Modu: "..(RidingMode[UUID] and "§aAKTİF 🐴" or "§7Kapalı"))
     return true
