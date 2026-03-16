@@ -1,11 +1,9 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        YAVER - Koruyucu Kurt Sistemi  v22            ║
--- ║        Zırh • Parıldama • Görev • Gelişmiş AI        ║
+-- ║        YAVER - Koruyucu Kurt Sistemi  v23            ║
+-- ║        Zırh • Parıldama • Görev • Vanilla AI         ║
 -- ╚══════════════════════════════════════════════════════╝
 
 local ActiveWolves    = {}   -- UUID → WolfID
-local WolfTargets     = {}   -- WolfID → TargetID
-local WolfAttackTick  = {}   -- WolfID → son saldırı tick'i
 local OpenBackpacks   = {}   -- UUID → Window
 local BackpackLastOpen= {}   -- UUID → os.clock()
 
@@ -14,8 +12,6 @@ local Ini = nil
 -- ══════════════════════════════════════════════════════
 --  SABİTLER
 -- ══════════════════════════════════════════════════════
-local ATTACK_CD    = 10    -- 10 döngü (2 tick x 10 = 20 tick = ~1 sn)
-local WOLF_SPEED   = 4.5   -- Döngü hızlandığı için hız dengelendi
 local BACKPACK_CD  = 0.5   -- sn (çift tıklama koruması)
 
 -- ══════════════════════════════════════════════════════
@@ -172,22 +168,6 @@ local function IsWolf(Entity)
     local t = Entity:GetMobType()
     local w = GetWolfType()
     return (t == w) or (t == 95)
-end
-
-local function MoveToward(Ent, tx, tz, speed)
-    local dx   = tx - Ent:GetPosX()
-    local dz   = tz - Ent:GetPosZ()
-    local dist = math.sqrt(dx*dx + dz*dz)
-    if dist < 0.1 then return end
-    local vx = (dx/dist) * speed
-    local vz = (dz/dist) * speed
-    local ok  = pcall(function() Ent:SetSpeedX(vx); Ent:SetSpeedZ(vz) end)
-    if not ok then
-        pcall(function()
-            Ent:AddSpeedX(vx - Ent:GetSpeedX())
-            Ent:AddSpeedZ(vz - Ent:GetSpeedZ())
-        end)
-    end
 end
 
 -- ══════════════════════════════════════════════════════
@@ -370,7 +350,7 @@ local function GetBackpack(UUID)
 end
 
 -- ══════════════════════════════════════════════════════
---  KURT OLUŞTURMA
+--  KURT OLUŞTURMA VE EVCİLLEŞTİRME (VANILLA AI)
 -- ══════════════════════════════════════════════════════
 local function SpawnWolfForPlayer(Player)
     local UUID  = Player:GetUUID()
@@ -379,9 +359,7 @@ local function SpawnWolfForPlayer(Player)
     if ActiveWolves[UUID] then
         local OldID = ActiveWolves[UUID]
         World:DoWithEntityByID(OldID, function(Ent) Ent:Destroy() end)
-        WolfTargets[OldID]    = nil
-        WolfAttackTick[OldID] = nil
-        ActiveWolves[UUID]    = nil
+        ActiveWolves[UUID] = nil
     end
 
     local WolfID = World:SpawnMob(
@@ -400,6 +378,14 @@ local function SpawnWolfForPlayer(Player)
         local ld  = GetLvlData(lvl)
 
         Ent:SetCustomNameAlwaysVisible(true)
+
+        -- Vanilla "Evcil Kurt" (Tamed Wolf) özelliklerini ayarla
+        local WolfCast = tolua.cast(Ent, "cWolf")
+        if WolfCast then
+            pcall(function() WolfCast:SetIsTame(true) end)
+            pcall(function() WolfCast:SetOwner(Player:GetName(), Player:GetUUID()) end)
+            pcall(function() WolfCast:SetIsSitting(false) end)
+        end
 
         local Mon = tolua.cast(Ent, "cMonster")
         if Mon then
@@ -422,7 +408,7 @@ end
 -- ══════════════════════════════════════════════════════
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(22)
+    Plugin:SetVersion(23)
 
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -437,10 +423,10 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurtgorev","", HandleQuestCommand,   "Görevleri göster.")
     cPluginManager:BindCommand("/kurtstats","", HandleStatsCommand,   "Kurt istatistikleri.")
 
-    -- Yapay zeka döngüsünü 2 tick'e indirdik (Daha akıcı hareket)
-    cRoot:Get():GetDefaultWorld():ScheduleTask(2, PeriodicWolfTask)
+    -- AI kaldırıldığı için döngüyü sadece efektler için yavaşlatıyoruz (1 saniyede bir çalışır)
+    cRoot:Get():GetDefaultWorld():ScheduleTask(20, PeriodicWolfTask)
 
-    LOG("[YAVER] v22 - Çakışan AI Düzeltildi • Daha Akıcı Savaş Sistemi Aktif!")
+    LOG("[YAVER] v23 - Manuel AI Kaldırıldı • Vanilla Evcil Hayvan Sistemi Aktif!")
     return true
 end
 
@@ -456,7 +442,6 @@ function HandleKurtCommand(CmdSplit, Player)
             Player:SendMessageWarning("§eKurdun yanına ışınlanıyor...")
             Player:GetWorld():DoWithEntityByID(ActiveWolves[UUID], function(Ent)
                 Ent:TeleportToEntity(Player)
-                WolfTargets[Ent:GetUniqueID()] = nil
             end)
         else
             SpawnWolfForPlayer(Player)
@@ -468,8 +453,6 @@ function HandleKurtCommand(CmdSplit, Player)
             Player:GetWorld():DoWithEntityByID(ActiveWolves[UUID], function(Ent)
                 Ent:Destroy()
             end)
-            WolfTargets[ActiveWolves[UUID]]    = nil
-            WolfAttackTick[ActiveWolves[UUID]] = nil
             ActiveWolves[UUID]  = nil
             Player:SendMessageInfo("§7Kurdun gönderildi.")
         end
@@ -552,8 +535,6 @@ function OnPlayerDestroyed(Player)
     local WolfID = ActiveWolves[UUID]
     if WolfID then
         Player:GetWorld():DoWithEntityByID(WolfID, function(Ent) Ent:Destroy() end)
-        WolfTargets[WolfID]    = nil
-        WolfAttackTick[WolfID] = nil
         ActiveWolves[UUID]     = nil
     end
     QuestStats[UUID] = nil
@@ -564,6 +545,7 @@ function OnRightClickingEntity(Player, Entity)
     local UUID = Player:GetUUID()
     if ActiveWolves[UUID] ~= Entity:GetUniqueID() then return false end
 
+    -- Oyuncu eğiliyorsa hiçbir işlem yapma (veya hub menüsünü açma vb.)
     if Player:IsCrouched() then
         cPluginManager:Get():ExecuteCommand(Player, "/hub")
         return true
@@ -590,6 +572,12 @@ function OnRightClickingEntity(Player, Entity)
         CheckQuests(UUID, "feed", 1)
 
     else
+        -- Vanilla'da sağ tıklamak kurdu oturtur, çanta açmak için bunu iptal etmeliyiz
+        local WolfCast = tolua.cast(Entity, "cWolf")
+        if WolfCast then
+            pcall(function() WolfCast:SetIsSitting(false) end)
+        end
+
         local now = os.clock()
         if OpenBackpacks[UUID] then return true end
         if BackpackLastOpen[UUID] and (now - BackpackLastOpen[UUID]) < BACKPACK_CD then
@@ -601,13 +589,15 @@ function OnRightClickingEntity(Player, Entity)
         OpenBackpacks[UUID] = Win
         Player:OpenWindow(Win)
     end
-    return true
+    
+    return true -- Orijinal oturtma/kaldırma mekaniğini ezmek için true döndürüyoruz
 end
 
 function OnTakeDamage(Receiver, TCA)
     local Attacker = TCA.Attacker
     if not Attacker then return false end
 
+    -- Dost ateşi koruması: Sahibi kılıcını savururken kazara kurda vurmasın
     if IsWolf(Receiver) and Attacker:IsPlayer() then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Receiver:GetUniqueID() and uuid == Attacker:GetUUID() then
@@ -615,14 +605,8 @@ function OnTakeDamage(Receiver, TCA)
             end
         end
     end
-    if Receiver:IsPlayer() and IsWolf(Attacker) then
-        for uuid, wid in pairs(ActiveWolves) do
-            if wid == Attacker:GetUniqueID() and uuid == Receiver:GetUUID() then
-                return true
-            end
-        end
-    end
 
+    -- Minecraft'ın kendi yapay zekası saldırdığında bizim ek hasarımızı ekle
     if IsWolf(Attacker) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Attacker:GetUniqueID() then
@@ -630,22 +614,6 @@ function OnTakeDamage(Receiver, TCA)
                 TCA.FinalDamage = TCA.FinalDamage + ld.dmg
                 AddWolfXP(uuid, 5)
                 CheckQuests(uuid, "damage", ld.dmg)
-            end
-        end
-    end
-
-    if Receiver:IsPlayer() then
-        local WolfID = ActiveWolves[Receiver:GetUUID()]
-        if WolfID and Attacker:GetUniqueID() ~= WolfID then
-            WolfTargets[WolfID] = Attacker:GetUniqueID()
-        end
-    end
-
-    if Attacker:IsPlayer() then
-        local WolfID = ActiveWolves[Attacker:GetUUID()]
-        if WolfID and Receiver:GetUniqueID() ~= WolfID then
-            if Receiver:IsMob() or (Receiver:IsPlayer() and Receiver:GetUUID() ~= Attacker:GetUUID()) then
-                WolfTargets[WolfID] = Receiver:GetUniqueID()
             end
         end
     end
@@ -659,9 +627,7 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
     if IsWolf(Victim) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Victim:GetUniqueID() then
-                ActiveWolves[uuid]    = nil
-                WolfTargets[wid]      = nil
-                WolfAttackTick[wid]   = nil
+                ActiveWolves[uuid] = nil
 
                 DoWithPlayer(uuid, function(P)
                     P:SendMessageWarning("§cKoruyucu kurdun yaralandı! 30 sn içinde döner.")
@@ -687,7 +653,7 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
 end
 
 -- ══════════════════════════════════════════════════════
---  PERİYODİK AI SİMÜLASYONU (Geliştirildi)
+--  PASİF EFEKTLER (Döngü Çok Yavaşlatıldı)
 -- ══════════════════════════════════════════════════════
 local GlobalTick = 0
 
@@ -704,106 +670,20 @@ function PeriodicWolfTask(World)
             if not Wolf then return end
 
             local lvl = GetWolfLevel(UUID)
-            local ld  = GetLvlData(lvl)
 
-            -- ────────────────────────────
-            -- SAVAŞ AI
-            -- ────────────────────────────
-            local TargetID       = WolfTargets[WolfID]
-            local HasValidTarget = false
+            -- Partiküller ve İksir efektleri
+            SpawnWolfParticles(World, Ent, lvl)
+            ApplyOwnerBuffs(Player, lvl)
 
-            if TargetID then
-                World:DoWithEntityByID(TargetID, function(TargetEnt)
-                    if not ((TargetEnt:IsMob() or TargetEnt:IsPlayer())
-                            and TargetEnt:GetHealth() > 0) then
-                        return
-                    end
-
-                    local dx   = TargetEnt:GetPosX() - Ent:GetPosX()
-                    local dz   = TargetEnt:GetPosZ() - Ent:GetPosZ()
-                    local dist = math.sqrt(dx*dx + dz*dz)
-
-                    local chaseRange = 20 + lvl
-                    if dist > chaseRange then return end
-
-                    HasValidTarget = true
-
-                    if dist > 2.5 then
-                        -- Hedef uzak, takip etmeye devam
-                        MoveToward(Ent,
-                            TargetEnt:GetPosX(),
-                            TargetEnt:GetPosZ(),
-                            ld.spd * WOLF_SPEED
-                        )
-                    else
-                        -- Hedefe yeterince yaklaşıldı -> FREN YAP (Kaymayı engeller)
-                        pcall(function()
-                            Ent:SetSpeedX(0)
-                            Ent:SetSpeedZ(0)
-                        end)
-                        
-                        -- Saldırı Bekleme Süresini Kontrol Et
-                        local lastAtk = WolfAttackTick[WolfID] or 0
-                        if (GlobalTick - lastAtk) >= ATTACK_CD then
-                            WolfAttackTick[WolfID] = GlobalTick
-                            local rawDmg = 4 + ld.dmg
-                            pcall(function()
-                                TargetEnt:TakeDamage(
-                                    cEntity.dtMobAttack or 3,
-                                    Ent, rawDmg, rawDmg, 0.5
-                                )
-                                World:BroadcastEntityAnimation(Ent, 0)
-                            end)
-                            AddWolfXP(UUID, 5)
-                            CheckQuests(UUID, "damage", rawDmg)
-                        end
-                    end
-                end)
-            end
-
-            -- Hedef yoksa sahibi takip et
-            if not HasValidTarget then
-                WolfTargets[WolfID] = nil
-                local dx   = Player:GetPosX() - Ent:GetPosX()
-                local dz   = Player:GetPosZ() - Ent:GetPosZ()
-                local dist = math.sqrt(dx*dx + dz*dz)
-
-                if dist > 20 then
-                    Ent:TeleportToEntity(Player)
-                elseif dist > 4 then
-                    MoveToward(Ent,
-                        Player:GetPosX(), Player:GetPosZ(),
-                        ld.spd * WOLF_SPEED * 0.8
-                    )
-                else
-                    -- Sahibinin yanına gelince FREN YAP
-                    pcall(function()
-                        Ent:SetSpeedX(0)
-                        Ent:SetSpeedZ(0)
-                    end)
-                end
-            end
-
-            -- ────────────────────────────
-            -- EFEKTLER VE YENİLENME (Döngü Hızlandığı İçin Seyreltildi)
-            -- ────────────────────────────
-            
-            -- Her ~1 Saniyede bir partikül ve buff
-            if GlobalTick % 10 == 0 then
-                SpawnWolfParticles(World, Ent, lvl)
-                ApplyOwnerBuffs(Player, lvl)
-            end
-
-            -- Her ~2.5 Saniyede bir can yenileme
-            if GlobalTick % 25 == 0 then
+            -- Can Yenileme
+            if GlobalTick % 3 == 0 then
                 if Wolf:GetHealth() < Wolf:GetMaxHealth() then
                     pcall(function() Wolf:Heal(1) end)
                 end
             end
-
         end)
     end)
 
-    -- Döngü hızlandırıldı: 10 tick yerine 2 tick
-    World:ScheduleTask(2, PeriodicWolfTask)
+    -- Saniyede 1 kere çalışır (Sunucuyu yormaz)
+    World:ScheduleTask(20, PeriodicWolfTask)
 end
