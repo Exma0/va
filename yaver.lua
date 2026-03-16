@@ -1,5 +1,5 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        YAVER - Koruyucu Kurt Sistemi  v21            ║
+-- ║        YAVER - Koruyucu Kurt Sistemi  v22            ║
 -- ║        Zırh • Parıldama • Görev • Gelişmiş AI        ║
 -- ╚══════════════════════════════════════════════════════╝
 
@@ -14,8 +14,8 @@ local Ini = nil
 -- ══════════════════════════════════════════════════════
 --  SABİTLER
 -- ══════════════════════════════════════════════════════
-local ATTACK_CD    = 20    -- tick; ~1 sn
-local WOLF_SPEED   = 7.0
+local ATTACK_CD    = 10    -- 10 döngü (2 tick x 10 = 20 tick = ~1 sn)
+local WOLF_SPEED   = 4.5   -- Döngü hızlandığı için hız dengelendi
 local BACKPACK_CD  = 0.5   -- sn (çift tıklama koruması)
 
 -- ══════════════════════════════════════════════════════
@@ -422,7 +422,7 @@ end
 -- ══════════════════════════════════════════════════════
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(21)
+    Plugin:SetVersion(22)
 
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -437,9 +437,10 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurtgorev","", HandleQuestCommand,   "Görevleri göster.")
     cPluginManager:BindCommand("/kurtstats","", HandleStatsCommand,   "Kurt istatistikleri.")
 
-    cRoot:Get():GetDefaultWorld():ScheduleTask(10, PeriodicWolfTask)
+    -- Yapay zeka döngüsünü 2 tick'e indirdik (Daha akıcı hareket)
+    cRoot:Get():GetDefaultWorld():ScheduleTask(2, PeriodicWolfTask)
 
-    LOG("[YAVER] v21 - Binme Özelliği Kaldırıldı • Zırh•Görev•Parıldama•GelişmişAI Aktif!")
+    LOG("[YAVER] v22 - Çakışan AI Düzeltildi • Daha Akıcı Savaş Sistemi Aktif!")
     return true
 end
 
@@ -686,7 +687,7 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
 end
 
 -- ══════════════════════════════════════════════════════
---  PERİYODİK AI SİMÜLASYONU
+--  PERİYODİK AI SİMÜLASYONU (Geliştirildi)
 -- ══════════════════════════════════════════════════════
 local GlobalTick = 0
 
@@ -727,13 +728,21 @@ function PeriodicWolfTask(World)
 
                     HasValidTarget = true
 
-                    if dist > 2.2 then
+                    if dist > 2.5 then
+                        -- Hedef uzak, takip etmeye devam
                         MoveToward(Ent,
                             TargetEnt:GetPosX(),
                             TargetEnt:GetPosZ(),
                             ld.spd * WOLF_SPEED
                         )
                     else
+                        -- Hedefe yeterince yaklaşıldı -> FREN YAP (Kaymayı engeller)
+                        pcall(function()
+                            Ent:SetSpeedX(0)
+                            Ent:SetSpeedZ(0)
+                        end)
+                        
+                        -- Saldırı Bekleme Süresini Kontrol Et
                         local lastAtk = WolfAttackTick[WolfID] or 0
                         if (GlobalTick - lastAtk) >= ATTACK_CD then
                             WolfAttackTick[WolfID] = GlobalTick
@@ -766,29 +775,35 @@ function PeriodicWolfTask(World)
                         Player:GetPosX(), Player:GetPosZ(),
                         ld.spd * WOLF_SPEED * 0.8
                     )
+                else
+                    -- Sahibinin yanına gelince FREN YAP
+                    pcall(function()
+                        Ent:SetSpeedX(0)
+                        Ent:SetSpeedZ(0)
+                    end)
                 end
             end
 
             -- ────────────────────────────
-            -- PARTİKEL EFEKTLERİ
+            -- EFEKTLER VE YENİLENME (Döngü Hızlandığı İçin Seyreltildi)
             -- ────────────────────────────
-            if GlobalTick % 4 == 0 then
+            
+            -- Her ~1 Saniyede bir partikül ve buff
+            if GlobalTick % 10 == 0 then
                 SpawnWolfParticles(World, Ent, lvl)
+                ApplyOwnerBuffs(Player, lvl)
             end
 
-            -- ────────────────────────────
-            -- SAHİBE BUFF
-            -- ────────────────────────────
-            ApplyOwnerBuffs(Player, lvl)
-
-            -- ────────────────────────────
-            -- KURT PASİF CAN YENİLEME
-            -- ────────────────────────────
-            if Wolf:GetHealth() < Wolf:GetMaxHealth() then
-                pcall(function() Wolf:Heal(1) end)
+            -- Her ~2.5 Saniyede bir can yenileme
+            if GlobalTick % 25 == 0 then
+                if Wolf:GetHealth() < Wolf:GetMaxHealth() then
+                    pcall(function() Wolf:Heal(1) end)
+                end
             end
+
         end)
     end)
 
-    World:ScheduleTask(10, PeriodicWolfTask)
+    -- Döngü hızlandırıldı: 10 tick yerine 2 tick
+    World:ScheduleTask(2, PeriodicWolfTask)
 end
