@@ -1,5 +1,5 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        YAVER - Koruyucu Kurt Sistemi  v24            ║
+-- ║        YAVER - Koruyucu Kurt Sistemi  v25            ║
 -- ║        Zırh • Parıldama • Görev • Vanilla AI         ║
 -- ╚══════════════════════════════════════════════════════╝
 
@@ -107,17 +107,25 @@ end
 
 local function CheckQuests(UUID, type_key, value_add)
     local stats = GetQuestStats(UUID)
-    stats[type_key] = (stats[type_key] or 0) + value_add
-    SaveQuestStats(UUID)
+    local lvl   = Ini:GetValueI(UUID, "Level", 1)
+
+    -- DÜZELTME #2: "level" tipi için stats tablosunu gereksiz yere
+    -- güncelliyordu (stats["level"] alanı hiç persist edilmiyor).
+    -- Seviye kontrolü doğrudan lvl değişkeninden yapılıyor.
+    if type_key ~= "level" then
+        stats[type_key] = (stats[type_key] or 0) + value_add
+        SaveQuestStats(UUID)
+    end
 
     local done = GetCompletedQuests(UUID)
-    local lvl  = Ini:GetValueI(UUID, "Level", 1)
 
     for _, qdef in ipairs(QUEST_DEFS) do
         if qdef.type == type_key and not done[qdef.id] then
-            local progress = stats[type_key] or 0
+            local progress
             if type_key == "level" then
                 progress = lvl
+            else
+                progress = stats[type_key] or 0
             end
             if progress >= qdef.req then
                 MarkQuestDone(UUID, qdef.id)
@@ -379,7 +387,6 @@ local function SpawnWolfForPlayer(Player)
 
         Ent:SetCustomNameAlwaysVisible(true)
 
-        -- Vanilla "Evcil Kurt" (Tamed Wolf) özelliklerini ayarla
         local WolfCast = tolua.cast(Ent, "cWolf")
         if WolfCast then
             pcall(function() WolfCast:SetIsTame(true) end)
@@ -408,7 +415,7 @@ end
 -- ══════════════════════════════════════════════════════
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(24)
+    Plugin:SetVersion(25)
 
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -423,10 +430,9 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurtgorev","", HandleQuestCommand,   "Görevleri göster.")
     cPluginManager:BindCommand("/kurtstats","", HandleStatsCommand,   "Kurt istatistikleri.")
 
-    -- AI kaldırıldığı için döngüyü sadece efektler için yavaşlatıyoruz (1 saniyede bir çalışır)
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, PeriodicWolfTask)
 
-    LOG("[YAVER] v24 - Shift+Sağ Tık Kaldırıldı • Görev İlerleme Bildirimi Eklendi!")
+    LOG("[YAVER] v25 - Tüm Dünya Desteği • CheckQuests Level Düzeltmesi!")
     return true
 end
 
@@ -565,7 +571,6 @@ function OnRightClickingEntity(Player, Entity)
 
         CheckQuests(UUID, "feed", 1)
         
-        -- Besleme görevinin anlık ilerlemesini chate yazdır
         local done = GetCompletedQuests(UUID)
         if not done["q_feed10"] then
             local stats = GetQuestStats(UUID)
@@ -574,7 +579,6 @@ function OnRightClickingEntity(Player, Entity)
         end
 
     else
-        -- Vanilla'da sağ tıklamak kurdu oturtur, çanta açmak için bunu iptal etmeliyiz
         local WolfCast = tolua.cast(Entity, "cWolf")
         if WolfCast then
             pcall(function() WolfCast:SetIsSitting(false) end)
@@ -592,14 +596,13 @@ function OnRightClickingEntity(Player, Entity)
         Player:OpenWindow(Win)
     end
     
-    return true -- Orijinal oturtma/kaldırma mekaniğini ezmek için true döndürüyoruz
+    return true
 end
 
 function OnTakeDamage(Receiver, TCA)
     local Attacker = TCA.Attacker
     if not Attacker then return false end
 
-    -- Dost ateşi koruması: Sahibi kılıcını savururken kazara kurda vurmasın
     if IsWolf(Receiver) and Attacker:IsPlayer() then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Receiver:GetUniqueID() and uuid == Attacker:GetUUID() then
@@ -608,7 +611,6 @@ function OnTakeDamage(Receiver, TCA)
         end
     end
 
-    -- Minecraft'ın kendi yapay zekası saldırdığında bizim ek hasarımızı ekle
     if IsWolf(Attacker) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Attacker:GetUniqueID() then
@@ -655,29 +657,33 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
 end
 
 -- ══════════════════════════════════════════════════════
---  PASİF EFEKTLER (Döngü Çok Yavaşlatıldı)
+--  PASİF EFEKTLER
 -- ══════════════════════════════════════════════════════
 local GlobalTick = 0
 
 function PeriodicWolfTask(World)
     GlobalTick = GlobalTick + 1
 
-    World:ForEachPlayer(function(Player)
+    -- DÜZELTME #1: Önceki kodda World:ForEachPlayer() kullanılıyordu.
+    -- Bu yalnızca varsayılan dünyayı (overworld) tarıyor; Nether/End
+    -- gibi diğer dünyalardaki oyuncular pasif efekt ve partikülleri
+    -- hiç alamıyordu.
+    -- Çözüm: cRoot:ForEachPlayer() tüm dünyelardaki oyuncuları tarar.
+    cRoot:Get():ForEachPlayer(function(Player)
         local UUID   = Player:GetUUID()
         local WolfID = ActiveWolves[UUID]
         if not WolfID then return end
 
-        World:DoWithEntityByID(WolfID, function(Ent)
+        local PlayerWorld = Player:GetWorld()
+        PlayerWorld:DoWithEntityByID(WolfID, function(Ent)
             local Wolf = tolua.cast(Ent, "cMonster")
             if not Wolf then return end
 
             local lvl = GetWolfLevel(UUID)
 
-            -- Partiküller ve İksir efektleri
-            SpawnWolfParticles(World, Ent, lvl)
+            SpawnWolfParticles(PlayerWorld, Ent, lvl)
             ApplyOwnerBuffs(Player, lvl)
 
-            -- Can Yenileme
             if GlobalTick % 3 == 0 then
                 if Wolf:GetHealth() < Wolf:GetMaxHealth() then
                     pcall(function() Wolf:Heal(1) end)
@@ -686,6 +692,5 @@ function PeriodicWolfTask(World)
         end)
     end)
 
-    -- Saniyede 1 kere çalışır (Sunucuyu yormaz)
     World:ScheduleTask(20, PeriodicWolfTask)
 end

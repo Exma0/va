@@ -1,26 +1,30 @@
 -- ╔══════════════════════════════════════════════════════╗
 -- ║       NETWORK TP - Gelişmiş Sunucu & TPA Sistemi     ║
--- ║       BungeeCord Otomatik Sunucu Algılama v2         ║
+-- ║       BungeeCord Otomatik Sunucu Algılama v3         ║
 -- ╚══════════════════════════════════════════════════════╝
 
-local TpaRequests = {}
-local ValidServers = {} -- Artık buraya isim yazmana gerek yok, BungeeCord dolduracak!
+local TpaRequests = {}   -- hedef_adı → gönderen_adı
+local ValidServers = {}
 local HasFetchedServers = false
 
 function Initialize(Plugin)
     Plugin:SetName("NetworkTP")
-    Plugin:SetVersion(2)
+    Plugin:SetVersion(3)
 
     cPluginManager:BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
     cPluginManager:BindCommand("/tpa",      "", HandleTpaCommand,      "Bir oyuncuya ışınlanma isteği atarsın.")
     cPluginManager:BindCommand("/tpaccept", "", HandleTpAcceptCommand, "Sana gelen ışınlanma isteğini kabul edersin.")
     cPluginManager:BindCommand("/tpdeny",   "", HandleTpDenyCommand,   "Sana gelen ışınlanma isteğini reddedersin.")
 
-    -- BungeeCord ile haberleşebilmek için gerekli Event Hook'ları
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED,   OnPlayerJoined)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,  OnPluginMessage)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED,    OnPlayerJoined)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,   OnPluginMessage)
 
-    LOG("[NetworkTP] v2 Yüklendi - BungeeCord Otomatik Algılama Sistemi Aktif!")
+    -- DÜZELTME #1: Oyuncu sunucudan ayrıldığında bekleyen TPA isteği
+    -- TpaRequests tablosunda sonsuza kadar kalıyordu (bellek sızıntısı).
+    -- Hem gönderici hem de hedef ayrıldığında ilgili kayıt temizleniyor.
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+
+    LOG("[NetworkTP] v3 Yüklendi - BungeeCord Otomatik Algılama + TPA Temizleme Aktif!")
     return true
 end
 
@@ -28,7 +32,6 @@ end
 --  BUNGEECORD HABERLEŞME MOTORU (Byte Parsing)
 -- ══════════════════════════════════════════════════════
 
--- Java UTF-8 formatını Cuberite'ın anlayabileceği Byte dizisine çevirir
 local function WriteJavaString(str)
     local len = #str
     local b1 = math.floor(len / 256)
@@ -36,7 +39,6 @@ local function WriteJavaString(str)
     return string.char(b1, b2) .. str
 end
 
--- BungeeCord'dan gelen karmaşık Byte paketlerini metne (String) dönüştürür
 local function ReadJavaString(msg, offset)
     if offset + 1 > #msg then return nil, offset end
     local len = string.byte(msg, offset) * 256 + string.byte(msg, offset + 1)
@@ -47,36 +49,53 @@ local function ReadJavaString(msg, offset)
 end
 
 function OnPlayerJoined(Player)
-    -- Eklenti iletişiminin çalışması için sunucuda en az 1 kişi olması gerekir.
-    -- İlk oyuncu girdiğinde BungeeCord'dan sunucu listesini istiyoruz.
     if not HasFetchedServers then
         Player:SendPluginMessage("BungeeCord", WriteJavaString("GetServers"))
     end
 end
 
 function OnPluginMessage(ClientHandle, Channel, Message)
-    -- Mesaj BungeeCord'dan gelmiyorsa yoksay
     if Channel ~= "BungeeCord" then return false end
 
     local subchannel, offset = ReadJavaString(Message, 1)
     
-    -- Gelen paket bizim istediğimiz "GetServers" yanıtı mı?
     if subchannel == "GetServers" then
         local serverListStr, _ = ReadJavaString(Message, offset)
         if serverListStr then
-            ValidServers = {} -- Eski listeyi temizle
-            
-            -- "hub, gm1, survival" formatındaki stringi virgüllerden bölüp listeye ekle
+            ValidServers = {}
             for server in string.gmatch(serverListStr, "([^,]+)") do
-                server = string.gsub(server, "^%s*(.-)%s*$", "%1") -- Boşlukları sil
+                server = string.gsub(server, "^%s*(.-)%s*$", "%1")
                 ValidServers[string.lower(server)] = true
             end
-            
             HasFetchedServers = true
             LOG("[NetworkTP] BungeeCord'daki sunucular otomatik eklendi: " .. serverListStr)
         end
     end
     return false
+end
+
+-- ══════════════════════════════════════════════════════
+--  OYUNCU AYRILINCA TEMİZLEME
+-- ══════════════════════════════════════════════════════
+function OnPlayerDestroyed(Player)
+    local leavingName = Player:GetName()
+
+    -- Hedef ayrıldı: bekleyen isteği iptal et ve göndericiyi bildir
+    if TpaRequests[leavingName] then
+        local senderName = TpaRequests[leavingName]
+        TpaRequests[leavingName] = nil
+        cRoot:Get():FindAndDoWithPlayer(senderName, function(SenderPlayer)
+            SenderPlayer:SendMessageFailure("§c" .. leavingName .. " §esunucudan ayrıldı; ışınlanma isteği iptal edildi.")
+        end)
+    end
+
+    -- Gönderici ayrıldı: hedefin tablosundaki kaydı temizle
+    for targetName, senderName in pairs(TpaRequests) do
+        if senderName == leavingName then
+            TpaRequests[targetName] = nil
+            break
+        end
+    end
 end
 
 -- ══════════════════════════════════════════════════════
@@ -91,16 +110,12 @@ function HandleTpCommand(Split, Player)
 
     local target = string.lower(Split[2])
 
-    -- Hedef BungeeCord listesinde var mı? (Ya da liste henüz çekilmediyse bile denemesine izin ver)
     if ValidServers[target] or not HasFetchedServers then
         Player:SendMessageSuccess("§a" .. string.upper(target) .. " §esunucusuna bağlanılıyor, lütfen bekle...")
-        
-        -- BungeeCord'a "Connect" sinyali yolla
         Player:SendPluginMessage("BungeeCord", WriteJavaString("Connect") .. WriteJavaString(target))
         return true
     end
 
-    -- Eğer listede yoksa bu bir oyuncudur diye uyarı ver
     Player:SendMessageWarning("§cAğ üzerinde '" .. target .. "' §aadında bir sunucu bulunamadı!")
     Player:SendMessageInfo("§7Eğer bir oyuncunun yanına gitmek istiyorsan §e/tpa " .. target .. " §7yazmalısın.")
     return true
@@ -129,10 +144,20 @@ function HandleTpaCommand(Split, Player)
         isPlayerFound = true
         local tName = TargetPlayer:GetName()
 
+        -- DÜZELTME #2: Önceki bir TPA isteği varsa eski göndericiye sessizce
+        -- kaybolmak yerine iptal mesajı gönder.
+        if TpaRequests[tName] then
+            local oldSender = TpaRequests[tName]
+            if oldSender ~= senderName then
+                cRoot:Get():FindAndDoWithPlayer(oldSender, function(OldSender)
+                    OldSender:SendMessageFailure("§c" .. tName .. " §eyeni bir ışınlanma isteği aldı; senin isteğin iptal edildi.")
+                end)
+            end
+        end
+
         TpaRequests[tName] = senderName
-        
+
         Player:SendMessageSuccess("§a" .. tName .. " §eadlı oyuncuya ışınlanma isteği gönderildi.")
-        
         TargetPlayer:SendMessageSuccess("§6" .. senderName .. " §esana ışınlanmak istiyor!")
         TargetPlayer:SendMessageInfo("§7Kabul etmek için §a/tpaccept§7, reddetmek için §c/tpdeny §7yaz.")
     end)
@@ -156,6 +181,8 @@ function HandleTpAcceptCommand(Split, Player)
         return true
     end
 
+    TpaRequests[targetName] = nil  -- Kabul/red öncesinde temizle (çift işlem koruması)
+
     local isSenderFound = false
 
     cRoot:Get():FindAndDoWithPlayer(senderName, function(SenderPlayer)
@@ -169,7 +196,6 @@ function HandleTpAcceptCommand(Split, Player)
         Player:SendMessageFailure("§cİsteği atan oyuncu şu an çevrimdışı veya başka sunucuya geçmiş.")
     end
 
-    TpaRequests[targetName] = nil
     return true
 end
 
@@ -185,11 +211,12 @@ function HandleTpDenyCommand(Split, Player)
         return true
     end
 
+    TpaRequests[targetName] = nil  -- Reddetmeden önce temizle
+
     cRoot:Get():FindAndDoWithPlayer(senderName, function(SenderPlayer)
         SenderPlayer:SendMessageFailure("§c" .. targetName .. " §eışınlanma isteğini reddetti.")
     end)
 
     Player:SendMessageSuccess("§eIşınlanma isteği reddedildi ve iptal edildi.")
-    TpaRequests[targetName] = nil
     return true
 end

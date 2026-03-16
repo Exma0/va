@@ -1,38 +1,26 @@
--- wcsync.lua  v3
+-- wcsync.lua  v4
 -- Görev: Oyuncu envanterini sunucular arası senkronize eder.
 -- engine.py bu eklentinin LOG() çıktılarını yakalar:
 --   WCSYNC_JOIN:<isim>:<uuid>  → dosyayı hub'dan çek, diske yaz, wcreload gönder
 --   WCSYNC_QUIT:<isim>:<uuid>  → dosyayı hub'a yükle
 
--- ─────────────────────────────────────────────────────────
--- HATA #1 DÜZELTMESİ: Çift WCSYNC_JOIN
--- Log'da aynı oyuncu için iki kez WCSYNC_JOIN tetikleniyor
--- (19:29:21 ve 19:29:22). Cuberite bazı durumlarda
--- HOOK_PLAYER_SPAWNED'ı iki kez ateşler (spawn + chunk yükü).
--- Çözüm: son JOIN zamanını kaydet, 5 sn içinde tekrar gelirse yoksay.
--- ─────────────────────────────────────────────────────────
-local RecentJoins  = {}   -- UUID → os.time() damgası
-local RecentQuits  = {}   -- UUID → os.time() damgası
+local RecentJoins  = {}
+local RecentQuits  = {}
 local JOIN_DEDUP   = 5    -- saniye
 local QUIT_DEDUP   = 3    -- saniye
 
--- Cuberite'ın gameserver modunda oyuncu dosyalarını kaydettiği dizin
--- (engine.py: persistent_world = "/server/world" for gameserver mode)
 local PLAYER_DIR = "/server/world/players/"
 
 function Initialize(Plugin)
     Plugin:SetName("WCSync")
-    Plugin:SetVersion(3)
+    Plugin:SetVersion(4)
 
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED,   OnPlayerSpawned)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
 
-    -- HATA #2 DÜZELTMESİ: wcreload konsol komutu kayıtlı değildi.
-    -- engine.py dosyayı diske yazdıktan sonra "wcreload <isim>" gönderir.
-    -- Kayıtsız olduğu için Cuberite "unknown command" veriyordu.
     cPluginManager:BindConsoleCommand("wcreload", HandleWcReload, "Oyuncu envanterini diskten yeniden yukler.")
 
-    LOG("[WCSYNC] Oyuncu Veri Senkronizasyon Sistemi Aktif!")
+    LOG("[WCSYNC] v4 - Sağlık/Açlık Değer Doğrulaması Eklendi!")
     return true
 end
 
@@ -40,15 +28,12 @@ function OnPlayerSpawned(Player)
     local UUID = Player:GetUUID()
     local now  = os.time()
 
-    -- Çift tetiklenmeyi önle
     if RecentJoins[UUID] and (now - RecentJoins[UUID]) < JOIN_DEDUP then
         return
     end
     RecentJoins[UUID] = now
 
     local name = Player:GetName()
-    -- engine.py bu satırı yakalar: oyuncu dosyasını hub'dan çeker,
-    -- PLAYER_DIR altına yazar ve "wcreload <name>" komutunu gönderir.
     LOG("WCSYNC_JOIN:" .. name .. ":" .. UUID)
 end
 
@@ -56,28 +41,15 @@ function OnPlayerDestroyed(Player)
     local UUID = Player:GetUUID()
     local now  = os.time()
 
-    -- Çift tetiklenmeyi önle
     if RecentQuits[UUID] and (now - RecentQuits[UUID]) < QUIT_DEDUP then
         return
     end
     RecentQuits[UUID] = now
 
     local name = Player:GetName()
-    -- engine.py bu satırı yakalar: oyuncu dosyasını hub'a yükler.
     LOG("WCSYNC_QUIT:" .. name .. ":" .. UUID)
 end
 
--- ─────────────────────────────────────────────────────────
--- HandleWcReload: engine.py dosyayı diske yazdıktan sonra bu
--- konsol komutunu çağırır. Oyuncu o an zaten varsayılan (boş)
--- envanter ile oyunda; biz JSON dosyasını okuyup envanteri
--- manuel olarak uyguluyoruz.
---
--- Cuberite player JSON formatı (Slot numaraları):
---   0-3  : Zırh (helmet=0, chestplate=1, leggings=2, boots=3)
---   9-17 : Hotbar
---   18-44: Ana envanter
--- ─────────────────────────────────────────────────────────
 function HandleWcReload(CmdSplit, EntireCommand)
     local name = CmdSplit[2]
     if not name or name == "" then
@@ -91,7 +63,6 @@ function HandleWcReload(CmdSplit, EntireCommand)
         local UUID      = Player:GetUUID()
         local uuidClean = UUID:gsub("%-", "")
 
-        -- Önce UUID ile, bulamazsa dash-free UUID ile dene
         local paths = {
             PLAYER_DIR .. UUID      .. ".json",
             PLAYER_DIR .. uuidClean .. ".json",
@@ -112,14 +83,12 @@ function HandleWcReload(CmdSplit, EntireCommand)
             return
         end
 
-        -- JSON dosyasını ayrıştır
         local data, err = cJson:Parse(content)
         if not data then
             LOG("[WCSYNC] " .. name .. " JSON parse hatasi: " .. tostring(err))
             return
         end
 
-        -- Envanteri sıfırla ve dosyadan yükle
         local inv = Player:GetInventory()
         inv:Clear()
 
@@ -138,12 +107,19 @@ function HandleWcReload(CmdSplit, EntireCommand)
             end
         end
 
-        -- Sağlık ve açlık durumunu da yükle
+        -- DÜZELTME #1: Sağlık ve açlık değerleri doğrulanmadan uygulanıyordu.
+        -- JSON dosyasında geçersiz (negatif, sıfır veya aşırı yüksek) değer
+        -- varsa oyuncu anında ölüyor veya açlık barı bozuluyordu.
+        -- Sağlık en az 1, en fazla MaxHealth; açlık 0–20 arasına sıkıştırıldı.
         if data["Health"] then
-            pcall(function() Player:SetHealth(tonumber(data["Health"])) end)
+            local hp = tonumber(data["Health"]) or 20
+            hp = math.max(1, math.min(hp, Player:GetMaxHealth()))
+            pcall(function() Player:SetHealth(hp) end)
         end
         if data["FoodLevel"] then
-            pcall(function() Player:SetFoodLevel(tonumber(data["FoodLevel"])) end)
+            local food = tonumber(data["FoodLevel"]) or 20
+            food = math.max(0, math.min(food, 20))
+            pcall(function() Player:SetFoodLevel(food) end)
         end
 
         LOG("[WCSYNC] " .. name .. " verisi basariyla yuklendi.")
