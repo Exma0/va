@@ -1,7 +1,11 @@
 -- wchub.lua
--- Görev: Sunucu listesini göstermek ve /hub /sunucu komutlarını yönetmek.
+-- Görev: Sunucu listesini göstermek ve /hub /sunucu /oyuncu komutlarını yönetmek.
 
 local ProxyURL = "http://127.0.0.1:{PORT}"
+
+-- Cooldown tablosu: Oyuncu UUID → son SendServerList zamanı (saniye)
+local LastSentTime = {}
+local COOLDOWN_SEC = 2.0  -- 2 saniyede bir kez listeyi göster
 
 local function Split(str, sep)
     local res = {}
@@ -11,9 +15,25 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(12)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED,    OnPlayerSpawned)
-    cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND,   OnCommand)
+    Plugin:SetVersion(13)
+
+    -- HATA DÜZELTMESİ: HOOK_EXECUTE_COMMAND YERİNE BindCommand kullan.
+    -- HOOK_EXECUTE_COMMAND sadece zaten BindCommand ile kayıtlı komutlar
+    -- çalıştırıldığında tetiklenir. Kayıtsız bir komut için Cuberite hook'u
+    -- hiç çağırmadan doğrudan "unknown command" mesajı verir.
+    -- Bu hatanın kanıtı log'daki 19:27:34 satırıdır:
+    --   "Player Ray issued an unknown command: '/hub'"
+    -- /kurt'un hiç bu mesajı vermemesinin nedeni ise yaver.lua'da
+    -- BindCommand ile kayıtlı olmasıdır.
+    cPluginManager:BindCommand("/hub",    "", HandleHubCommand, "Sunucu listesini goster.")
+    cPluginManager:BindCommand("/sunucu", "", HandleHubCommand, "Sunucu listesini goster.")
+    cPluginManager:BindCommand("/oyuncu", "", HandleHubCommand, "Sunucu listesini goster.")
+
+    -- /wc_transfer: proxy tarafından işlenir; "unknown command" çıkmaması için kayıt
+    cPluginManager:BindCommand("/wc_transfer", "", HandleTransferCommand, "Sunucu transferi.")
+
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
+
     LOG("[HUB] WCHub Saf Sohbet Sistemi Aktif!")
     return true
 end
@@ -24,27 +44,32 @@ function OnPlayerSpawned(Player)
     end)
 end
 
-function OnCommand(Player, CommandSplit, EntireCommand)
-    local cmd = string.lower(CommandSplit[1] or "")
-    if cmd == "/hub" or cmd == "/sunucu" then
-        SendServerList(Player)
-        return true
-    end
-    -- HATA DÜZELTMESİ: /wc_transfer komutu proxy tarafından işlenir,
-    -- ama HOOK_EXECUTE_COMMAND'dan "bilinmeyen komut" uyarısı çıkmaması
-    -- için burada da kabul ediyoruz.
-    if cmd == "/wc_transfer" then
-        return true
-    end
-    return false
+function HandleHubCommand(CmdSplit, Player)
+    SendServerList(Player)
+    return true
+end
+
+function HandleTransferCommand(CmdSplit, Player)
+    -- Gerçek transfer proxy'de pipe_c2s içinde yapılır.
+    -- Burada sadece "unknown command" mesajını bastırıyoruz.
+    return true
 end
 
 function SendServerList(Player)
-    local PlayerName = Player:GetName()
-    local World = Player:GetWorld()
+    -- HATA DÜZELTMESİ: Cooldown (hız sınırı).
+    -- Önceki kodda sınır yoktu; /hub'a her basışta yeni bir async HTTP
+    -- isteği açılıyor ve panel defalarca gönderiliyordu.
+    -- Log: 19:28:42-54 arasında tam 16 kez /hub tetiklendi.
+    local UUID = Player:GetUUID()
+    local now  = os.time()
+    if LastSentTime[UUID] and (now - LastSentTime[UUID]) < COOLDOWN_SEC then
+        return
+    end
+    LastSentTime[UUID] = now
 
-    -- HATA DÜZELTMESİ: cUrlClient her zaman bir tablo (global) olarak
-    -- tanımlıdır; nil olup olmadığını type() ile değil doğrudan kontrol et.
+    local PlayerName = Player:GetName()
+    local World      = Player:GetWorld()
+
     if not cUrlClient then return end
 
     cUrlClient:Get(ProxyURL .. "/api/servers", {
@@ -78,7 +103,7 @@ function SendServerList(Player)
             end)
         end,
         OnError = function(Err)
-            -- Proxy bağlantı hatası sessizce yut; sunucu listesi gösterilmez.
+            -- Proxy bağlantı hatası — sessizce yut
         end
     })
 end

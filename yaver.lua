@@ -1,6 +1,12 @@
 local ActiveWolves = {}
 local OpenBackpacks = {}
 local WolfTargets = {}
+-- HATA DÜZELTMESİ: "Wrong window ID" uyarısını önlemek için backpack cooldown.
+-- Oyuncu kısa sürede kurda iki kez tıklarsa GetBackpack() iki ayrı cLuaWindow
+-- nesnesi oluşturur; sunucu ikincisini ID+1 ile açarken client hâlâ birincisinin
+-- paketlerini gönderiyor → "Wrong window ID (exp N+1, got N)" uyarısı.
+local BackpackLastOpen = {}   -- UUID → os.clock() zaman damgası
+local BACKPACK_COOLDOWN = 0.5 -- saniye
 local WolfAttackTick = {}  -- Saldırı cooldown takibi (kurt ID başına)
 local Ini = nil
 
@@ -273,6 +279,16 @@ function OnRightClickingEntity(Player, Entity)
                 AddWolfXP(UUID, 50)
                 Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
             else
+                -- Cooldown kontrolü: çift tıkta iki pencere açılmasın
+                local now = os.clock()
+                if BackpackLastOpen[UUID] and (now - BackpackLastOpen[UUID]) < BACKPACK_COOLDOWN then
+                    return true  -- Çok hızlı, ikinci pencereyi engelle
+                end
+                -- Eğer zaten açık bir pencere varsa önce onu kapat
+                if OpenBackpacks[UUID] then
+                    return true  -- Açık pencere kapanmadan yenisini açma
+                end
+                BackpackLastOpen[UUID] = now
                 local Win = GetBackpack(UUID)
                 OpenBackpacks[UUID] = Win
                 Player:OpenWindow(Win)
