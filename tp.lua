@@ -11,18 +11,18 @@ function Initialize(Plugin)
     Plugin:SetName("NetworkTP")
     Plugin:SetVersion(3)
 
-    cPluginManager:BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
-    cPluginManager:BindCommand("/tpa",      "", HandleTpaCommand,      "Bir oyuncuya ışınlanma isteği atarsın.")
-    cPluginManager:BindCommand("/tpaccept", "", HandleTpAcceptCommand, "Sana gelen ışınlanma isteğini kabul edersin.")
-    cPluginManager:BindCommand("/tpdeny",   "", HandleTpDenyCommand,   "Sana gelen ışınlanma isteğini reddedersin.")
+    cPluginManager.BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
+    cPluginManager.BindCommand("/tpa",      "", HandleTpaCommand,      "Bir oyuncuya ışınlanma isteği atarsın.")
+    cPluginManager.BindCommand("/tpaccept", "", HandleTpAcceptCommand, "Sana gelen ışınlanma isteğini kabul edersin.")
+    cPluginManager.BindCommand("/tpdeny",   "", HandleTpDenyCommand,   "Sana gelen ışınlanma isteğini reddedersin.")
 
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED,    OnPlayerJoined)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,   OnPluginMessage)
+    cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_JOINED,    OnPlayerJoined)
+    cPluginManager.AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,   OnPluginMessage)
 
     -- DÜZELTME #1: Oyuncu sunucudan ayrıldığında bekleyen TPA isteği
     -- TpaRequests tablosunda sonsuza kadar kalıyordu (bellek sızıntısı).
     -- Hem gönderici hem de hedef ayrıldığında ilgili kayıt temizleniyor.
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
 
     LOG("[NetworkTP] v3 Yüklendi - BungeeCord Otomatik Algılama + TPA Temizleme Aktif!")
     return true
