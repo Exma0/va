@@ -1,6 +1,7 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.2        ║
+-- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.3        ║
 -- ║  Sohbet, TP, Bungee, SafeSpawn, WCSync, ClearLag vb. ║
+-- ║  * YENİ: Global Hata Yönetimi ve Chat Raporlama      ║
 -- ╚══════════════════════════════════════════════════════╝
 
 -- ========================================================
@@ -26,7 +27,7 @@ local TimeUntilClear = ClearLag_Config.Interval
 -- [Otomatik Sohbet Temizleyici]
 local ChatClear_Config = {
     Enabled  = true,
-    Interval = 600 -- 10 dakikada bir (600 saniye) temizler. Dilersen değiştirebilirsin.
+    Interval = 600
 }
 local TimeUntilChatClear = ChatClear_Config.Interval
 
@@ -51,43 +52,74 @@ local PLAYER_DIR = "/server/world/players/"
 local LastMsg = {}
 
 -- ========================================================
+-- HATA YÖNETİMİ (ERROR HANDLING) SİSTEMİ
+-- ========================================================
+function BroadcastError(kaynak, hata)
+    local kisaHata = string.sub(tostring(hata), 1, 100)
+    local mesaj = "§8[§4SİSTEM HATASI§8] §7" .. kaynak .. " -> §c" .. kisaHata
+    cRoot:Get():BroadcastChat(mesaj)
+    LOGWARNING("[WCMaster HATA] Kaynak: " .. kaynak .. " | Detay: " .. tostring(hata))
+end
+
+function SafeTask(kaynak, func)
+    return function(a, b, c, d, e)
+        local ok, err = pcall(function() return func(a, b, c, d, e) end)
+        if not ok then BroadcastError(kaynak, err) end
+    end
+end
+
+local function SafeWrap(funcName, sourceName)
+    local originalFunc = _G[funcName]
+    if type(originalFunc) == "function" then
+        _G[funcName] = function(a, b, c, d, e)
+            local ok, err = pcall(function() return originalFunc(a, b, c, d, e) end)
+            if not ok then 
+                BroadcastError(sourceName, err) 
+                return true -- Komut hatasıysa sunucuyu çökertmeden işlemi iptal et
+            end
+            return err -- pcall başarılıysa asıl fonksiyonun dönüş değerini ilet
+        end
+    end
+end
+
+-- ========================================================
 -- BAŞLATICI (INITIALIZE) VE KOMUT KAYITLARI
 -- ========================================================
 function Initialize(Plugin)
     Plugin:SetName("WCMasterPlugin")
-    Plugin:SetVersion(2)
+    Plugin:SetVersion(3)
 
     local PM = cRoot:Get():GetPluginManager()
 
     -- [Yardım ve Sohbet Komutları]
-    PM:BindCommand("/yardim",   "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
-    PM:BindCommand("/komutlar", "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
-    PM:BindCommand("/msg",      "", HandleMsgCommand,      "Bir oyuncuya özel mesaj gönderir.")
-    PM:BindCommand("/r",        "", HandleReplyCommand,    "Son özel mesaja hızlı yanıt verir.")
-    PM:BindCommand("/zar",      "", HandleZarCommand,      "Zar atar.")
-    PM:BindCommand("/kurallar", "", HandleKurallarCommand, "Kuralları gösterir.")
+    PM:BindCommand("/yardim",   "", "HandleYardimCommand",   "Kullanabileceğin komutları listeler.")
+    PM:BindCommand("/komutlar", "", "HandleYardimCommand",   "Kullanabileceğin komutları listeler.")
+    PM:BindCommand("/msg",      "", "HandleMsgCommand",      "Bir oyuncuya özel mesaj gönderir.")
+    PM:BindCommand("/r",        "", "HandleReplyCommand",    "Son özel mesaja hızlı yanıt verir.")
+    PM:BindCommand("/zar",      "", "HandleZarCommand",      "Zar atar.")
+    PM:BindCommand("/kurallar", "", "HandleKurallarCommand", "Kuralları gösterir.")
 
     -- [Sohbet Temizleme Komutları]
-    PM:BindCommand("/sil",      "chat.admin", HandleClearChatCommand, "Sohbet penceresini temizler.")
-    PM:BindCommand("/cc",       "chat.admin", HandleClearChatCommand, "Sohbet penceresini temizler.")
+    PM:BindCommand("/sil",      "chat.admin", "HandleClearChatCommand", "Sohbet penceresini temizler.")
+    PM:BindCommand("/cc",       "chat.admin", "HandleClearChatCommand", "Sohbet penceresini temizler.")
 
     -- [NetworkTP Komutları]
-    PM:BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
-    PM:BindCommand("/tpa",      "", HandleTpaCommand,      "Işınlanma isteği atarsın.")
-    PM:BindCommand("/tpaccept", "", HandleTpAcceptCommand, "Işınlanma isteğini kabul edersin.")
-    PM:BindCommand("/tpdeny",   "", HandleTpDenyCommand,   "Işınlanma isteğini reddedersin.")
+    PM:BindCommand("/tp",       "", "HandleTpCommand",       "Sunucuya geçiş yaparsın.")
+    PM:BindCommand("/tpa",      "", "HandleTpaCommand",      "Işınlanma isteği atarsın.")
+    PM:BindCommand("/tpaccept", "", "HandleTpAcceptCommand", "Işınlanma isteğini kabul edersin.")
+    PM:BindCommand("/tpdeny",   "", "HandleTpDenyCommand",   "Işınlanma isteğini reddedersin.")
 
     -- [WCHub Komutları]
-    PM:BindCommand("/hub",         "", HandleHubCommand,      "Sunucu listesini goster.")
-    PM:BindCommand("/sunucu",      "", HandleHubCommand,      "Sunucu listesini goster.")
-    PM:BindCommand("/oyuncu",      "", HandleHubCommand,      "Sunucu listesini goster.")
-    PM:BindCommand("/wc_transfer", "", HandleTransferCommand, "Sunucu transferi (proxy).")
+    PM:BindCommand("/hub",         "", "HandleHubCommand",      "Sunucu listesini goster.")
+    PM:BindCommand("/sunucu",      "", "HandleHubCommand",      "Sunucu listesini goster.")
+    PM:BindCommand("/oyuncu",      "", "HandleHubCommand",      "Sunucu listesini goster.")
+    PM:BindCommand("/wc_transfer", "", "HandleTransferCommand", "Sunucu transferi (proxy).")
 
     -- [ClearLag Komutları]
-    PM:BindCommand("/clearlag", "clearlag.admin", HandleClearLagCommand, "Lag temizleyici.")
+    PM:BindCommand("/clearlag", "clearlag.admin", "HandleClearLagCommand", "Lag temizleyici.")
 
     -- [WCSync Konsol Komutları]
-    PM:BindConsoleCommand("wcreload", HandleWcReload, "Oyuncu envanterini yeniden yukler.")
+    PM:BindConsoleCommand("wcreload", "HandleWcReload", "Oyuncu envanterini yeniden yukler.")
 
     -- [Merkezi Event Hook'ları]
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_SPAWNED,   Global_OnPlayerSpawned)
@@ -95,15 +127,39 @@ function Initialize(Plugin)
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_JOINED,    Global_OnPlayerJoined)
     cPluginManager.AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,   Global_OnPluginMessage)
 
-    -- ClearLag Otomatik Döngüsünü Başlat
+    -- Döngüleri Başlat
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearLag)
-
-    -- Otomatik Sohbet Temizleme Döngüsünü Başlat
     if ChatClear_Config.Enabled then
         cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearChat)
     end
 
-    LOG("[WCMaster] v1.2 - Otomatik Sohbet Temizleyici Eklendi, sistem hazir!")
+    -- ========================================================
+    -- FONKSİYONLARI HATA KALKANI (WRAPPER) İLE KAPLA
+    -- ========================================================
+    SafeWrap("HandleYardimCommand", "/yardim komutu")
+    SafeWrap("HandleMsgCommand", "/msg komutu")
+    SafeWrap("HandleReplyCommand", "/r komutu")
+    SafeWrap("HandleZarCommand", "/zar komutu")
+    SafeWrap("HandleKurallarCommand", "/kurallar komutu")
+    SafeWrap("HandleClearChatCommand", "/sil komutu")
+    SafeWrap("HandleTpCommand", "/tp komutu")
+    SafeWrap("HandleTpaCommand", "/tpa komutu")
+    SafeWrap("HandleTpAcceptCommand", "/tpaccept komutu")
+    SafeWrap("HandleTpDenyCommand", "/tpdeny komutu")
+    SafeWrap("HandleHubCommand", "/hub komutu")
+    SafeWrap("HandleTransferCommand", "Hub Transfer Sistemi")
+    SafeWrap("HandleClearLagCommand", "/clearlag komutu")
+    SafeWrap("HandleWcReload", "wcreload sistemi")
+
+    SafeWrap("Global_OnPlayerSpawned", "Oyuncu Doğma (Spawn) Eventi")
+    SafeWrap("Global_OnPlayerDestroyed", "Oyuncu Çıkış Eventi")
+    SafeWrap("Global_OnPlayerJoined", "Oyuncu Katılma Eventi")
+    SafeWrap("Global_OnPluginMessage", "BungeeCord Bağlantı Eventi")
+    
+    SafeWrap("TimerTick_ClearLag", "Otomatik Lag Temizleyici")
+    SafeWrap("TimerTick_ClearChat", "Otomatik Sohbet Temizleyici")
+
+    LOG("[WCMaster] v1.3 - Global Hata Koruma Sistemi AKTİF!")
     return true
 end
 
@@ -178,7 +234,7 @@ function TimerTick_ClearChat(World)
         PerformChatClear("Otomatik Sistem")
         TimeUntilChatClear = ChatClear_Config.Interval
     end
-    World:ScheduleTask(20, TimerTick_ClearChat)
+    World:ScheduleTask(20, TimerTick_ClearChat) -- Döngü, SafeWrap ile korumalıdır
 end
 
 function PerformChatClear(SenderName)
@@ -192,7 +248,7 @@ end
 
 function HandleClearChatCommand(Split, Player)
     PerformChatClear(Player:GetName())
-    TimeUntilChatClear = ChatClear_Config.Interval -- Manuel temizlenince sayacı başa sar
+    TimeUntilChatClear = ChatClear_Config.Interval 
     return true
 end
 
@@ -311,7 +367,7 @@ local function FindSafeLand(Player, World, startX, startZ, attempt)
     local chunkX = math.floor(searchX / 16)
     local chunkZ = math.floor(searchZ / 16)
 
-    World:ChunkStay({ {chunkX, chunkZ} }, nil, function()
+    World:ChunkStay({ {chunkX, chunkZ} }, nil, SafeTask("SafeSpawn Zemin Tarama", function()
         local y = World:GetHeight(searchX, searchZ)
         if y > 0 then
             local blockSurface = World:GetBlock(searchX, y - 1, searchZ)
@@ -325,13 +381,13 @@ local function FindSafeLand(Player, World, startX, startZ, attempt)
         else
             FindSafeLand(Player, World, startX, startZ, attempt + 1)
         end
-    end)
+    end))
 end
 
 function SafeSpawn_CheckLand(Player)
     local World = Player:GetWorld()
     local UUID = Player:GetUUID()
-    World:ScheduleTask(10, function()
+    World:ScheduleTask(10, SafeTask("SafeSpawn Döngüsü", function()
         cRoot:Get():DoWithPlayerByUUID(UUID, function(P)
             local px, py, pz = math.floor(P:GetPosX()), math.floor(P:GetPosY()), math.floor(P:GetPosZ())
             local blockAtFeet = World:GetBlock(px, py, pz)
@@ -341,14 +397,14 @@ function SafeSpawn_CheckLand(Player)
                 FindSafeLand(P, World, px, pz, 1)
             end
         end)
-    end)
+    end))
 end
 
 -- ========================================================
 -- WCHUB SİSTEMİ (SUNUCU LİSTESİ)
 -- ========================================================
 function WCHub_ShowMenu(Player)
-    Player:GetWorld():ScheduleTask(20, function() SendServerList(Player) end)
+    Player:GetWorld():ScheduleTask(20, SafeTask("Hub Menü Açılışı", function() SendServerList(Player) end))
 end
 
 function HandleHubCommand(CmdSplit, Player)
@@ -371,8 +427,8 @@ function SendServerList(Player)
     if not cUrlClient then return end
 
     cUrlClient:Get(ProxyURL .. "/api/servers", {
-        OnSuccess = function(Body)
-            World:ScheduleTask(0, function()
+        OnSuccess = SafeTask("Sunucu Listesi Veri Çekme", function(Body)
+            World:ScheduleTask(0, SafeTask("Sunucu Listesi Ekrana Yazma", function()
                 local TargetPlayer = nil
                 cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P) TargetPlayer = P end)
                 if not TargetPlayer or not Body or Body == "" then return end
@@ -399,8 +455,8 @@ function SendServerList(Player)
                 if count == 0 then TargetPlayer:SendMessageInfo("§c  Şu an aktif sunucu yok.") end
                 TargetPlayer:SendMessageInfo("§8§m                                     ")
                 TargetPlayer:SendMessageInfo(" ")
-            end)
-        end,
+            end))
+        end),
         OnError = function(Err) end
     })
 end
@@ -582,7 +638,7 @@ function TimerTick_ClearLag(World)
         PerformClear()
         TimeUntilClear = ClearLag_Config.Interval
     end
-    World:ScheduleTask(20, TimerTick_ClearLag)
+    World:ScheduleTask(20, TimerTick_ClearLag) -- Döngü, SafeWrap ile korumalıdır
 end
 
 function PerformClear()
