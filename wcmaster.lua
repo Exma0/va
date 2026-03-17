@@ -1,5 +1,5 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.0        ║
+-- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.1        ║
 -- ║  Sohbet, TP, Bungee, SafeSpawn, WCSync, ClearLag vb. ║
 -- ╚══════════════════════════════════════════════════════╝
 
@@ -52,31 +52,32 @@ function Initialize(Plugin)
 
     local PM = cRoot:Get():GetPluginManager()
 
+    -- DÜZELTME: Tırnak işaretleri kaldırıldı! Cuberite artık hata vermeyecek.
     -- [Yardım ve Sohbet Komutları]
-    PM:BindCommand("/yardim",   "", "HandleYardimCommand",   "Kullanabileceğin komutları listeler.")
-    PM:BindCommand("/komutlar", "", "HandleYardimCommand",   "Kullanabileceğin komutları listeler.")
-    PM:BindCommand("/msg",      "", "HandleMsgCommand",      "Bir oyuncuya özel mesaj gönderir.")
-    PM:BindCommand("/r",        "", "HandleReplyCommand",    "Son özel mesaja hızlı yanıt verir.")
-    PM:BindCommand("/zar",      "", "HandleZarCommand",      "Zar atar.")
-    PM:BindCommand("/kurallar", "", "HandleKurallarCommand", "Kuralları gösterir.")
+    PM:BindCommand("/yardim",   "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
+    PM:BindCommand("/komutlar", "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
+    PM:BindCommand("/msg",      "", HandleMsgCommand,      "Bir oyuncuya özel mesaj gönderir.")
+    PM:BindCommand("/r",        "", HandleReplyCommand,    "Son özel mesaja hızlı yanıt verir.")
+    PM:BindCommand("/zar",      "", HandleZarCommand,      "Zar atar.")
+    PM:BindCommand("/kurallar", "", HandleKurallarCommand, "Kuralları gösterir.")
 
     -- [NetworkTP Komutları]
-    PM:BindCommand("/tp",       "", "HandleTpCommand",       "Sunucuya geçiş yaparsın.")
-    PM:BindCommand("/tpa",      "", "HandleTpaCommand",      "Işınlanma isteği atarsın.")
-    PM:BindCommand("/tpaccept", "", "HandleTpAcceptCommand", "Işınlanma isteğini kabul edersin.")
-    PM:BindCommand("/tpdeny",   "", "HandleTpDenyCommand",   "Işınlanma isteğini reddedersin.")
+    PM:BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
+    PM:BindCommand("/tpa",      "", HandleTpaCommand,      "Işınlanma isteği atarsın.")
+    PM:BindCommand("/tpaccept", "", HandleTpAcceptCommand, "Işınlanma isteğini kabul edersin.")
+    PM:BindCommand("/tpdeny",   "", HandleTpDenyCommand,   "Işınlanma isteğini reddedersin.")
 
     -- [WCHub Komutları]
-    PM:BindCommand("/hub",         "", "HandleHubCommand",      "Sunucu listesini goster.")
-    PM:BindCommand("/sunucu",      "", "HandleHubCommand",      "Sunucu listesini goster.")
-    PM:BindCommand("/oyuncu",      "", "HandleHubCommand",      "Sunucu listesini goster.")
-    PM:BindCommand("/wc_transfer", "", "HandleTransferCommand", "Sunucu transferi (proxy).")
+    PM:BindCommand("/hub",         "", HandleHubCommand,      "Sunucu listesini goster.")
+    PM:BindCommand("/sunucu",      "", HandleHubCommand,      "Sunucu listesini goster.")
+    PM:BindCommand("/oyuncu",      "", HandleHubCommand,      "Sunucu listesini goster.")
+    PM:BindCommand("/wc_transfer", "", HandleTransferCommand, "Sunucu transferi (proxy).")
 
     -- [ClearLag Komutları]
-    PM:BindCommand("/clearlag", "clearlag.admin", "HandleClearLagCommand", "Lag temizleyici.")
+    PM:BindCommand("/clearlag", "clearlag.admin", HandleClearLagCommand, "Lag temizleyici.")
 
     -- [WCSync Konsol Komutları]
-    PM:BindConsoleCommand("wcreload", "HandleWcReload", "Oyuncu envanterini yeniden yukler.")
+    PM:BindConsoleCommand("wcreload", HandleWcReload, "Oyuncu envanterini yeniden yukler.")
 
     -- [Merkezi Event Hook'ları]
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_SPAWNED,   Global_OnPlayerSpawned)
@@ -87,7 +88,7 @@ function Initialize(Plugin)
     -- ClearLag Otomatik Döngüsünü Başlat
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearLag)
 
-    LOG("[WCMaster] v1.0 - Tum sistemler basariyla tek dosyada birlestirildi!")
+    LOG("[WCMaster] v1.1 - Komut baglama hatalari giderildi, sistem aktif!")
     return true
 end
 
@@ -95,36 +96,26 @@ end
 -- MERKEZİ EVENT FONKSİYONLARI (GLOBAL HOOKS)
 -- ========================================================
 function Global_OnPlayerSpawned(Player)
-    -- 1. SafeSpawn Kontrolü
     SafeSpawn_CheckLand(Player)
-    -- 2. WCHub Menüsü Gösterimi
     WCHub_ShowMenu(Player)
-    -- 3. WCSync Envanter Bildirimi
     WCSync_JoinNotify(Player)
 end
 
 function Global_OnPlayerDestroyed(Player)
-    -- 1. Sohbet Hafızasını Temizle
     LastMsg[Player:GetName()] = nil
-    -- 2. NetworkTP TPA İsteklerini Temizle
     NetworkTP_CleanRequests(Player)
-    -- 3. WCHub Anti-Spam Temizliği
     HubLastSentTime[Player:GetUUID()] = nil
-    -- 4. WCSync Kayıt Bildirimi
     WCSync_QuitNotify(Player)
 end
 
 function Global_OnPlayerJoined(Player)
-    -- BungeeCord Sunucu Listesi İsteği (NetworkTP)
     if not HasFetchedServers then
         Player:SendPluginMessage("BungeeCord", WriteJavaString("GetServers"))
     end
 end
 
 function Global_OnPluginMessage(ClientHandle, Channel, Message)
-    -- BungeeCord Sunucu Listesi Cevabı (NetworkTP)
     if Channel ~= "BungeeCord" then return false end
-
     local subchannel, offset = ReadJavaString(Message, 1)
     if subchannel == "GetServers" then
         local serverListStr, _ = ReadJavaString(Message, offset)
