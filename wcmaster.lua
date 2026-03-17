@@ -1,5 +1,5 @@
 -- ╔══════════════════════════════════════════════════════╗
--- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.1        ║
+-- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.2        ║
 -- ║  Sohbet, TP, Bungee, SafeSpawn, WCSync, ClearLag vb. ║
 -- ╚══════════════════════════════════════════════════════╝
 
@@ -22,6 +22,13 @@ local ClearLag_Config = {
     UnloadChunks   = true
 }
 local TimeUntilClear = ClearLag_Config.Interval
+
+-- [Otomatik Sohbet Temizleyici]
+local ChatClear_Config = {
+    Enabled  = true,
+    Interval = 600 -- 10 dakikada bir (600 saniye) temizler. Dilersen değiştirebilirsin.
+}
+local TimeUntilChatClear = ChatClear_Config.Interval
 
 -- [NetworkTP]
 local TpaRequests = {}   
@@ -48,11 +55,10 @@ local LastMsg = {}
 -- ========================================================
 function Initialize(Plugin)
     Plugin:SetName("WCMasterPlugin")
-    Plugin:SetVersion(1)
+    Plugin:SetVersion(2)
 
     local PM = cRoot:Get():GetPluginManager()
 
-    -- DÜZELTME: Tırnak işaretleri kaldırıldı! Cuberite artık hata vermeyecek.
     -- [Yardım ve Sohbet Komutları]
     PM:BindCommand("/yardim",   "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
     PM:BindCommand("/komutlar", "", HandleYardimCommand,   "Kullanabileceğin komutları listeler.")
@@ -60,6 +66,10 @@ function Initialize(Plugin)
     PM:BindCommand("/r",        "", HandleReplyCommand,    "Son özel mesaja hızlı yanıt verir.")
     PM:BindCommand("/zar",      "", HandleZarCommand,      "Zar atar.")
     PM:BindCommand("/kurallar", "", HandleKurallarCommand, "Kuralları gösterir.")
+
+    -- [Sohbet Temizleme Komutları]
+    PM:BindCommand("/sil",      "chat.admin", HandleClearChatCommand, "Sohbet penceresini temizler.")
+    PM:BindCommand("/cc",       "chat.admin", HandleClearChatCommand, "Sohbet penceresini temizler.")
 
     -- [NetworkTP Komutları]
     PM:BindCommand("/tp",       "", HandleTpCommand,       "Sunucuya geçiş yaparsın.")
@@ -88,7 +98,12 @@ function Initialize(Plugin)
     -- ClearLag Otomatik Döngüsünü Başlat
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearLag)
 
-    LOG("[WCMaster] v1.1 - Komut baglama hatalari giderildi, sistem aktif!")
+    -- Otomatik Sohbet Temizleme Döngüsünü Başlat
+    if ChatClear_Config.Enabled then
+        cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearChat)
+    end
+
+    LOG("[WCMaster] v1.2 - Otomatik Sohbet Temizleyici Eklendi, sistem hazir!")
     return true
 end
 
@@ -152,6 +167,33 @@ function ReadJavaString(msg, offset)
     offset = offset + 2
     if offset + len - 1 > #msg then return nil, offset end
     return string.sub(msg, offset, offset + len - 1), offset + len
+end
+
+-- ========================================================
+-- OTOMATİK SOHBET TEMİZLEYİCİ (CLEAR CHAT)
+-- ========================================================
+function TimerTick_ClearChat(World)
+    TimeUntilChatClear = TimeUntilChatClear - 1
+    if TimeUntilChatClear <= 0 then
+        PerformChatClear("Otomatik Sistem")
+        TimeUntilChatClear = ChatClear_Config.Interval
+    end
+    World:ScheduleTask(20, TimerTick_ClearChat)
+end
+
+function PerformChatClear(SenderName)
+    for i = 1, 100 do
+        cRoot:Get():BroadcastChat(" ")
+    end
+    cRoot:Get():BroadcastChatInfo("§8§m                                     ")
+    cRoot:Get():BroadcastChatSuccess("§8[§bSistem§8] §aSohbet penceresi §e" .. SenderName .. " §atarafından temizlendi!")
+    cRoot:Get():BroadcastChatInfo("§8§m                                     ")
+end
+
+function HandleClearChatCommand(Split, Player)
+    PerformChatClear(Player:GetName())
+    TimeUntilChatClear = ChatClear_Config.Interval -- Manuel temizlenince sayacı başa sar
+    return true
 end
 
 -- ========================================================
