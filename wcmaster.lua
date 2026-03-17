@@ -2,7 +2,8 @@
 -- ║        WC NETWORK ULTIMATE MASTER PLUGIN v1.5        ║
 -- ║  Sohbet, TP, Bungee, SafeSpawn, WCSync, ClearLag    ║
 -- ║  BUG FIX: Hafıza sızıntısı, entity iterasyon,       ║
--- ║           WriteJavaString overflow, TPA tablo hatası ║
+-- ║           WriteJavaString overflow, TPA tablo hatası,║
+-- ║           SendPluginMessage ClientHandle Hatası     ║
 -- ╚══════════════════════════════════════════════════════╝
 
 -- ========================================================
@@ -174,7 +175,11 @@ end
 
 function Global_OnPlayerJoined(Player)
     if not HasFetchedServers then
-        Player:SendPluginMessage("BungeeCord", WriteJavaString("GetServers"))
+        -- DÜZELTME: BungeeCord mesajları doğrudan Player üzerinden değil, ClientHandle üzerinden gönderilmeli.
+        local client = Player:GetClientHandle()
+        if client then
+            client:SendPluginMessage("BungeeCord", WriteJavaString("GetServers"))
+        end
     end
 end
 
@@ -538,10 +543,15 @@ function HandleTpCommand(Split, Player)
         Player:SendMessageSuccess(
             "§a" .. string.upper(target) .. " §esunucusuna bağlanılıyor..."
         )
-        Player:SendPluginMessage(
-            "BungeeCord",
-            WriteJavaString("Connect") .. WriteJavaString(target)
-        )
+        
+        -- DÜZELTME: BungeeCord mesajları doğrudan Player üzerinden değil, ClientHandle üzerinden gönderilmeli.
+        local client = Player:GetClientHandle()
+        if client then
+            client:SendPluginMessage(
+                "BungeeCord",
+                WriteJavaString("Connect") .. WriteJavaString(target)
+            )
+        end
     else
         Player:SendMessageWarning(
             "§cAğda '" .. target .. "' adında bir sunucu bulunamadı!"
