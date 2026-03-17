@@ -44,15 +44,11 @@ local HubLastSentTime   = {}
 local HUB_COOLDOWN_SEC  = 2
 
 -- [WCSync]
--- BUG FIX #1 — SyncRecentJoins/Quits tabloları artık TTL ile temizleniyor.
--- Önceden: UUID anahtarları hiç silinmiyordu → sunucu uzun süre çalışırken
--- bellek tüketimi sürekli artıyordu (hafıza sızıntısı).
-local SyncRecentJoins   = {}   -- { [uuid] = timestamp }
-local SyncRecentQuits   = {}   -- { [uuid] = timestamp }
+local SyncRecentJoins   = {}
+local SyncRecentQuits   = {}
 local JOIN_DEDUP        = 5
 local QUIT_DEDUP        = 3
-local SYNC_CLEANUP_INTERVAL = 300  -- 5 dakikada bir eski kayıtları temizle
-local PLAYER_DIR        = "/server/world/players/"
+local SYNC_CLEANUP_INTERVAL = 300
 
 -- [Sohbet]
 local LastMsg = {}
@@ -95,7 +91,6 @@ function Initialize(Plugin)
     Plugin:SetName("WCMasterPlugin")
     Plugin:SetVersion(5)
 
-    -- 1. ADIM: FONKSİYONLARI HATA KALKANI İLE KAPLA
     local toWrap = {
         {"HandleYardimCommand",    "/yardim komutu"},
         {"HandleMsgCommand",       "/msg komutu"},
@@ -123,7 +118,6 @@ function Initialize(Plugin)
         SafeWrap(pair[1], pair[2])
     end
 
-    -- 2. ADIM: KOMUTLARI KAYDET
     local PM = cRoot:Get():GetPluginManager()
     PM:BindCommand("/yardim",    "", HandleYardimCommand,   "Komut listesi.")
     PM:BindCommand("/komutlar",  "", HandleYardimCommand,   "Komut listesi.")
@@ -144,18 +138,15 @@ function Initialize(Plugin)
     PM:BindCommand("/clearlag",  "clearlag.admin", HandleClearLagCommand, "Lag temizle.")
     PM:BindConsoleCommand("wcreload", HandleWcReload, "Oyuncu envanterini yeniden yükle.")
 
-    -- 3. ADIM: EVENTLERİ KAYDET
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_SPAWNED,   Global_OnPlayerSpawned)
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, Global_OnPlayerDestroyed)
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_JOINED,    Global_OnPlayerJoined)
     cPluginManager.AddHook(cPluginManager.HOOK_PLUGIN_MESSAGE,   Global_OnPluginMessage)
 
-    -- 4. ADIM: DÖNGÜLERİ BAŞLAT
     cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearLag)
     if ChatClear_Config.Enabled then
         cRoot:Get():GetDefaultWorld():ScheduleTask(20, TimerTick_ClearChat)
     end
-    -- BUG FIX #1 devamı — Periyodik bellek temizleyicisini başlat
     cRoot:Get():GetDefaultWorld():ScheduleTask(
         SYNC_CLEANUP_INTERVAL * 20, TimerTick_SyncCleanup
     )
@@ -218,13 +209,9 @@ local function Hub_Split(str, sep)
     return res
 end
 
--- BUG FIX #2 — WriteJavaString: 65535 byte sınırı kontrol ediliyor.
--- Önceden: len > 65535 durumunda 2 byte'lık length alanı sessizce taşıyordu,
--- bu da BungeeCord tarafında protokol hatasına yol açıyordu.
 function WriteJavaString(str)
     local len = #str
     if len > 65535 then
-        LOGWARNING("[WCMaster] WriteJavaString: string çok uzun (" .. len .. " byte), kırpıldı.")
         str = string.sub(str, 1, 65535)
         len = 65535
     end
@@ -240,13 +227,12 @@ function ReadJavaString(msg, offset)
 end
 
 -- ========================================================
--- PERİYODİK SYNC BELLEK TEMİZLEYİCİ (BUG FIX #1)
+-- PERİYODİK SYNC BELLEK TEMİZLEYİCİ
 -- ========================================================
 function TimerTick_SyncCleanup(World)
     local now     = os.time()
     local maxAge  = math.max(JOIN_DEDUP, QUIT_DEDUP) + 10
 
-    -- Süresi geçmiş UUID kayıtlarını temizle
     local removeJoin = {}
     for uuid, ts in pairs(SyncRecentJoins) do
         if (now - ts) > maxAge then table.insert(removeJoin, uuid) end
@@ -511,7 +497,6 @@ function SendServerList(Player)
             end))
         end),
         OnError = function(Err)
-            -- Sessiz başarısızlık: sunucu listesi geçici olarak erişilemez olabilir
         end
     })
 end
@@ -522,7 +507,6 @@ end
 function NetworkTP_CleanRequests(Player)
     local leavingName = Player:GetName()
 
-    -- Oyuncu bekleyen bir isteğe sahipse göndereni bilgilendir
     if TpaRequests[leavingName] then
         local senderName = TpaRequests[leavingName]
         TpaRequests[leavingName] = nil
@@ -533,10 +517,6 @@ function NetworkTP_CleanRequests(Player)
         end)
     end
 
-    -- BUG FIX #3 — TpaRequests tablosu pairs() ile gezerken doğrudan
-    -- değiştirilmiyordu; silinecek anahtarlar önce toplanıyor, sonra siliniyor.
-    -- Önceden: TpaRequests[targetName] = nil + break — pairs() döngüsünde tablo
-    -- mutasyonu Lua 5.1/LuaJIT'de tanımsız davranış üretir.
     local toRemove = {}
     for targetName, senderName in pairs(TpaRequests) do
         if senderName == leavingName then
@@ -587,7 +567,6 @@ function HandleTpaCommand(Split, Player)
     cRoot:Get():FindAndDoWithPlayer(targetName, function(TP)
         isFound = true
         local tName = TP:GetName()
-        -- Eski isteği iptal et
         if TpaRequests[tName] and TpaRequests[tName] ~= senderName then
             cRoot:Get():FindAndDoWithPlayer(TpaRequests[tName], function(OldSender)
                 OldSender:SendMessageFailure(
@@ -673,9 +652,13 @@ function HandleWcReload(CmdSplit, EntireCommand)
     cRoot:Get():FindAndDoWithPlayer(name, function(Player)
         local UUID      = Player:GetUUID()
         local uuidClean = UUID:gsub("%-", "")
+        
+        -- DÜZELTME: Hem gameserver (/server/) hem de Hub modunun (/data/) dosyalarını tara.
         local paths     = {
-            PLAYER_DIR .. UUID      .. ".json",
-            PLAYER_DIR .. uuidClean .. ".json"
+            "/server/world/players/" .. UUID .. ".json",
+            "/server/world/players/" .. uuidClean .. ".json",
+            "/data/world/players/" .. UUID .. ".json",
+            "/data/world/players/" .. uuidClean .. ".json"
         }
         local content = nil
 
@@ -690,8 +673,6 @@ function HandleWcReload(CmdSplit, EntireCommand)
 
         if not content or content == "" then return end
 
-        -- BUG FIX #4 — cJson:Parse pcall ile korunuyor.
-        -- Önceden: bozuk JSON → yakalanmamış hata → plugin crash.
         local ok, data = pcall(function()
             return cJson:Parse(content)
         end)
@@ -757,10 +738,6 @@ function TimerTick_ClearLag(World)
 end
 
 function PerformClear()
-    -- BUG FIX #5 — Entity yok etme işlemi artık iterasyon dışında yapılıyor.
-    -- Önceden: ForEachEntity döngüsü içinde Entity:Destroy() çağrısı Cuberite'ın
-    -- bazı sürümlerinde entity listesini bozarak crash'e yol açabiliyordu.
-    -- Yeni yaklaşım: önce toplanır, sonra yok edilir.
     local toDestroy    = {}
     local removedCount = 0
 
