@@ -1,6 +1,1 @@
-wchub.lua
-wcsync.lua
-ada.lua
-tp.lua
-lag.lua
-msg.lua
+wcmaster.lua
